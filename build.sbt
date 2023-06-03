@@ -19,7 +19,7 @@ ThisBuild / githubWorkflowBuildPreamble ++= nativeBrewInstallWorkflowSteps.value
 
 val CatsEffectVersion = "3.5.0"
 
-lazy val root = tlCrossRootProject.aggregate(ir)
+lazy val root = tlCrossRootProject.aggregate(ir, onnx, runtime)
 
 lazy val ir = project
   .enablePlugins(ScalaNativePlugin)
