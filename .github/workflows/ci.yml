@@ -66,6 +66,9 @@ jobs:
             ~/Library/Caches/Coursier/v1
           key: ${{ runner.os }}-sbt-cache-v2-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
 
+      - name: brew update
+        run: /home/linuxbrew/.linuxbrew/bin/brew update
+
       - name: Install brew formulae (ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
         run: /home/linuxbrew/.linuxbrew/bin/brew install mlpack openblas

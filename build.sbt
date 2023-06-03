@@ -13,6 +13,8 @@ ThisBuild / tlSonatypeUseLegacyHost := false
 ThisBuild / crossScalaVersions := Seq("3.3.0", "2.13.10")
 
 ThisBuild / githubWorkflowJavaVersions := Seq(JavaSpec.temurin("17"))
+ThisBuild / githubWorkflowBuildPreamble +=
+  WorkflowStep.Run(List("/home/linuxbrew/.linuxbrew/bin/brew update"), name = Some("brew update"))
 ThisBuild / githubWorkflowBuildPreamble ++= nativeBrewInstallWorkflowSteps.value
 
 val CatsEffectVersion = "3.5.0"
