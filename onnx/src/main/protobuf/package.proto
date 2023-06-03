@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package onnx;
+
+import "scalapb/scalapb.proto";
+
+option (scalapb.options) = {
+  scope: PACKAGE
+  flat_package: true
+  lenses: false
+  package_name: "vilcacora.onnx.proto"
+};
