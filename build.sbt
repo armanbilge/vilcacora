@@ -13,6 +13,7 @@ ThisBuild / tlSonatypeUseLegacyHost := false
 ThisBuild / crossScalaVersions := Seq("3.3.0", "2.13.10")
 
 ThisBuild / githubWorkflowJavaVersions := Seq(JavaSpec.temurin("17"))
+ThisBuild / githubWorkflowBuildPreamble ++= nativeBrewInstallWorkflowSteps.value
 
 val CatsEffectVersion = "3.5.0"
 
@@ -53,11 +54,12 @@ lazy val onnx = project
   .dependsOn(ir)
 
 lazy val runtime = project
-  .enablePlugins(ScalaNativePlugin)
+  .enablePlugins(ScalaNativePlugin, ScalaNativeBrewedConfigPlugin)
   .dependsOn(ir)
   .settings(
     name := "vilcacora-runtime",
     libraryDependencies ++= Seq(
       "org.typelevel" %%% "cats-effect-kernel" % CatsEffectVersion,
     ),
+    nativeBrewFormulas ++= Set("openblas", "mlpack"),
   )
