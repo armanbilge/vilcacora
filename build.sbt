@@ -6,18 +6,19 @@ ThisBuild / developers ++= List(
   tlGitHubDev("archisman-dey", "Archisman Dey"),
   tlGitHubDev("armanbilge", "Arman Bilge"),
   tlGitHubDev("valencik", "Andrew Valencik"),
+  tlGitHubDev("pantShrey", "Shrey Pant"),
 )
 ThisBuild / startYear := Some(2023)
 ThisBuild / tlSonatypeUseLegacyHost := false
+ThisBuild / resolvers += "Sonatype Releases" at "https://oss.sonatype.org/content/repositories/releases/"
+ThisBuild / crossScalaVersions := Seq("3.3.4", "2.13.16")
 
-ThisBuild / crossScalaVersions := Seq("3.3.0", "2.13.10")
-
-ThisBuild / githubWorkflowJavaVersions := Seq(JavaSpec.temurin("17"))
+ThisBuild / githubWorkflowJavaVersions := Seq(JavaSpec.temurin("17") , JavaSpec.temurin("21"))
 ThisBuild / githubWorkflowBuildPreamble +=
   WorkflowStep.Run(List("/home/linuxbrew/.linuxbrew/bin/brew update"), name = Some("brew update"))
 ThisBuild / githubWorkflowBuildPreamble ++= nativeBrewInstallWorkflowSteps.value
 
-val CatsEffectVersion = "3.5.0"
+val CatsEffectVersion = "3.7-8f2b497"
 
 lazy val root = tlCrossRootProject.aggregate(ir, onnx, runtime)
 
@@ -46,7 +47,7 @@ lazy val onnx = project
         streams.value.log.info("Downloading onnx.proto3 ...")
         val f = target.value / "protobuf_external_src" / "onnx.proto"
         IO.transfer(
-          url("https://raw.githubusercontent.com/onnx/onnx/v1.14.0/onnx/onnx.proto3").openStream(),
+          url("https://raw.githubusercontent.com/onnx/onnx/rel-1.9.0/onnx/onnx.proto3").openStream(),
           f,
         )
         f
