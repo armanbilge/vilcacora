@@ -18,7 +18,7 @@ ThisBuild / githubWorkflowBuildPreamble +=
 ThisBuild / githubWorkflowBuildPreamble ++= nativeBrewInstallWorkflowSteps.value
 
 val CatsEffectVersion = "3.7-8f2b497"
-val scalaPbVersion = "0.11.17"
+
 lazy val root = tlCrossRootProject.aggregate(ir, onnx, runtime)
 
 lazy val ir = project
@@ -34,8 +34,7 @@ lazy val onnx = project
   .settings(
     name := "vilcacora-onnx",
     libraryDependencies ++= Seq(
-      "com.thesamet.scalapb" %% "scalapb-runtime" % scalaPbVersion % "protobuf",
-      "com.thesamet.scalapb" %% "compilerplugin" % scalaPbVersion,
+      "com.thesamet.scalapb" %% "scalapb-runtime" % scalapb.compiler.Version.scalapbVersion % "protobuf",
     ),
     Compile / PB.generate := (Compile / PB.generate).dependsOn(Compile / downloadOnnxProto).value,
     Compile / PB.targets := Seq(
