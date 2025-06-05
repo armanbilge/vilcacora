@@ -54,7 +54,7 @@ lazy val onnx = project
         f
       }
     },
-    scalacOptions += "-Wconf:src=src_managed/.*:w",
+    scalacOptions += "-Wconf:src=src_managed/.*:i",
   )
   .dependsOn(ir)
 
