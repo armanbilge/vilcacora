@@ -3,19 +3,16 @@ ThisBuild / tlBaseVersion := "0.0"
 ThisBuild / organization := "com.armanbilge"
 ThisBuild / organizationName := "Arman Bilge"
 ThisBuild / developers ++= List(
-  tlGitHubDev("archisman-dey", "Archisman Dey"),
+  tlGitHubDev("pantShrey", "Shrey Pant"),
   tlGitHubDev("armanbilge", "Arman Bilge"),
   tlGitHubDev("valencik", "Andrew Valencik"),
-  tlGitHubDev("pantShrey", "Shrey Pant"),
 )
 ThisBuild / startYear := Some(2023)
 ThisBuild / tlSonatypeUseLegacyHost := false
-ThisBuild / resolvers += "Sonatype Releases".at(
-  "https://oss.sonatype.org/content/repositories/releases/",
-)
+
 ThisBuild / crossScalaVersions := Seq("3.3.4", "2.13.16")
 
-ThisBuild / githubWorkflowJavaVersions := Seq(JavaSpec.temurin("17"), JavaSpec.temurin("21"))
+ThisBuild / githubWorkflowJavaVersions := Seq(JavaSpec.temurin("21"))
 ThisBuild / githubWorkflowBuildPreamble +=
   WorkflowStep.Run(List("/home/linuxbrew/.linuxbrew/bin/brew update"), name = Some("brew update"))
 ThisBuild / githubWorkflowBuildPreamble ++= nativeBrewInstallWorkflowSteps.value
@@ -57,6 +54,7 @@ lazy val onnx = project
         f
       }
     },
+    scalacOptions += "-Wconf:src=src_managed/.*:w",
   )
   .dependsOn(ir)
 
