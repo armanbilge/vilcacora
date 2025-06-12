@@ -103,6 +103,18 @@ object Operation {
     override def outputs: Seq[String] = Seq(output)
   }
 
+  // Operation for element wise multiplication
+  final case class Mul(inputA: String, inputB: String, output: String) extends Operation {
+    override def inputs: Seq[String] = Seq(inputA, inputB)
+    override def outputs: Seq[String] = Seq(output)
+  }
+
+  // Operation for changing a tensor's data type
+  final case class Cast(input: String, output: String, to: DataType) extends Operation {
+    override def inputs: Seq[String] = Seq(input)
+    override def outputs: Seq[String] = Seq(output)
+  }
+
   /** Represents an `SVMClassifier` operation. All configuration attributes are stored as fields in
     * the case class.
     */
