@@ -50,37 +50,37 @@ final case class Allocation(
 
 /** representation of the `kernel_type` attribute for SVM nodes.
   */
-sealed trait SVMKernel
+sealed abstract class SVMKernel
 object SVMKernel {
-  case object LINEAR extends SVMKernel
-  case object POLY extends SVMKernel
-  case object RBF extends SVMKernel
-  case object SIGMOID extends SVMKernel
+  case object Linear extends SVMKernel
+  case object Poly extends SVMKernel
+  case object Rbf extends SVMKernel
+  case object Sigmoid extends SVMKernel
 
   def fromString(s: String): Either[String, SVMKernel] = s.toUpperCase match {
-    case "LINEAR" => Right(LINEAR)
-    case "POLY" => Right(POLY)
-    case "RBF" => Right(RBF)
-    case "SIGMOID" => Right(SIGMOID)
+    case "LINEAR" => Right(Linear)
+    case "POLY" => Right(Poly)
+    case "RBF" => Right(Rbf)
+    case "SIGMOID" => Right(Sigmoid)
     case other => Left(s"Unsupported SVM Kernel: $other")
   }
 }
 
 /** Type-safe representation of the `post_transform` attribute for SVM nodes. */
-sealed trait PostTransform
+sealed abstract class PostTransform
 object PostTransform {
-  case object NONE extends PostTransform
-  case object SOFTMAX extends PostTransform
-  case object LOGISTIC extends PostTransform
-  case object SOFTMAX_ZERO extends PostTransform
-  case object PROBIT extends PostTransform
+  case object None extends PostTransform
+  case object Softmax extends PostTransform
+  case object Logistic extends PostTransform
+  case object Softmax_Zero extends PostTransform
+  case object Probit extends PostTransform
 
   def fromString(s: String): Either[String, PostTransform] = s.toUpperCase match {
-    case "NONE" => Right(NONE)
-    case "SOFTMAX" => Right(SOFTMAX)
-    case "LOGISTIC" => Right(LOGISTIC)
-    case "SOFTMAX_ZERO" => Right(SOFTMAX_ZERO)
-    case "PROBIT" => Right(PROBIT)
+    case "NONE" => Right(None)
+    case "SOFTMAX" => Right(Softmax)
+    case "LOGISTIC" => Right(Logistic)
+    case "SOFTMAX_ZERO" => Right(Softmax_Zero)
+    case "PROBIT" => Right(Probit)
     case other => Left(s"Unsupported PostTransform: $other")
   }
 }
@@ -88,31 +88,31 @@ object PostTransform {
 /** An ADT representing a single operation in the computation graph.
   */
 sealed abstract class Operation {
-  def inputs: Seq[String]
-  def outputs: Seq[String]
+  def inputs: List[String]
+  def outputs: List[String]
 }
 
 object Operation {
   final case class MatMul(inputA: String, inputB: String, output: String) extends Operation {
-    override def inputs: Seq[String] = Seq(inputA, inputB)
-    override def outputs: Seq[String] = Seq(output)
+    override def inputs: List[String] = List(inputA, inputB)
+    override def outputs: List[String] = List(output)
   }
 
   final case class Add(inputA: String, inputB: String, output: String) extends Operation {
-    override def inputs: Seq[String] = Seq(inputA, inputB)
-    override def outputs: Seq[String] = Seq(output)
+    override def inputs: List[String] = List(inputA, inputB)
+    override def outputs: List[String] = List(output)
   }
 
   // Operation for element wise multiplication
   final case class Mul(inputA: String, inputB: String, output: String) extends Operation {
-    override def inputs: Seq[String] = Seq(inputA, inputB)
-    override def outputs: Seq[String] = Seq(output)
+    override def inputs: List[String] = List(inputA, inputB)
+    override def outputs: List[String] = List(output)
   }
 
   // Operation for changing a tensor's data type
   final case class Cast(input: String, output: String, to: DataType) extends Operation {
-    override def inputs: Seq[String] = Seq(input)
-    override def outputs: Seq[String] = Seq(output)
+    override def inputs: List[String] = List(input)
+    override def outputs: List[String] = List(output)
   }
 
   /** Represents an `SVMClassifier` operation. All configuration attributes are stored as fields in
@@ -123,17 +123,17 @@ object Operation {
       outputLabel: String,
       outputScores: String,
       // --- Attributes ---
-      classLabels: Seq[Long],
-      coefficients: Seq[Float],
+      classLabels: List[Long],
+      coefficients: Array[Double],
       kernelType: SVMKernel,
-      kernelParams: Seq[Float],
+      kernelParams: List[Double],
       postTransform: PostTransform,
-      rho: Seq[Float],
-      supportVectors: Seq[Float],
-      vectorsPerClass: Seq[Long],
+      rho: List[Double],
+      supportVectors: Array[Double],
+      vectorsPerClass: List[Long],
   ) extends Operation {
-    override def inputs: Seq[String] = Seq(input)
-    override def outputs: Seq[String] = Seq(outputLabel, outputScores)
+    override def inputs: List[String] = List(input)
+    override def outputs: List[String] = List(outputLabel, outputScores)
   }
 
   /** Represents an `SVMRegressor` operation. All configuration attributes are stored as fields in
@@ -143,17 +143,17 @@ object Operation {
       input: String,
       output: String,
       // --- Attributes ---
-      coefficients: Seq[Float],
-      kernelParams: Seq[Float],
+      coefficients: Array[Double],
+      kernelParams: List[Double],
       kernelType: SVMKernel,
       nSupports: Long,
       oneClass: Boolean,
       postTransform: PostTransform,
-      rho: Seq[Float],
-      supportVectors: Seq[Float],
+      rho: List[Double],
+      supportVectors: Array[Double],
   ) extends Operation {
-    override def inputs: Seq[String] = Seq(input)
-    override def outputs: Seq[String] = Seq(output)
+    override def inputs: List[String] = List(input)
+    override def outputs: List[String] = List(output)
   }
   // Add more operations here...
 }
@@ -162,8 +162,8 @@ object Operation {
   */
 case class ModelIR(
     name: String,
-    operations: Seq[Operation],
+    operations: List[Operation],
     allocations: Map[String, Allocation],
-    graphInputs: Seq[String],
-    graphOutputs: Seq[String],
+    graphInputs: List[String],
+    graphOutputs: List[String],
 )
