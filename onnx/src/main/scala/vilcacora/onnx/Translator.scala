@@ -20,14 +20,14 @@ import com.armanbilge.vilcacora.ir._
 import vilcacora.onnx.proto._
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import cats.syntax.all._
 
 /** Translates an ONNX `ModelProto` into a custom, type-safe `ModelIR`.
   *
   * The primary goals of this translator are:
   *   1. To convert the protobuf-based ONNX graph into a more easily consumable Scala ADT. 2. To
   *      resolve all memory requirements at compile-time by creating `Allocation` objects for every
-  *      tensor (inputs, outputs, weights, and intermediate results). 3. To handle dynamic input
-  *      dimensions by substituting them with a fixed `maxBatchSize`.
+  *      tensor (inputs, outputs, weights, and intermediate results).
   */
 object Translator {
 
@@ -35,26 +35,19 @@ object Translator {
     *
     * @param model
     *   The ONNX model loaded from a protobuf file.
-    * @param maxBatchSize
-    *   The static size to use for any dynamic dimensions in tensor shapes.
+    *
     * @return
     *   An `Either` containing the translated `ModelIR` on success, or an error message on failure.
     */
-  def translate(model: ModelProto, maxBatchSize: Int = 1): Either[String, ModelIR] =
+  def translate(model: ModelProto): Either[String, ModelIR] =
     for {
       graph <- model.graph.toRight("Model does not contain a graph")
-      allocations <- buildAllocations(graph, maxBatchSize)
+      allocations <- buildAllocations(graph)
 
       // Translate all nodes into IR operations.
 
-      reversedOps <- graph.node.foldLeft[Either[String, List[Operation]]](Right(Nil)) {
-        (acc, node) =>
-          for {
-            opList <- acc
-            newOp <- translateNode(node)
-          } yield newOp :: opList
-      }
-      operations = reversedOps.reverse
+      operations <- graph.node.toList.traverse(translateNode)
+
       graphInputs = graph.input.map(_.name)
       graphOutputs = graph.output.map(_.name)
 
@@ -87,31 +80,19 @@ object Translator {
     */
   private def buildAllocations(
       graph: GraphProto,
-      maxBatchSize: Int,
   ): Either[String, Map[String, Allocation]] = {
     // Collect all tensor *declarations* (which define shape and type).
     val allValueProtos = graph.input ++ graph.valueInfo ++ graph.output
 
     // Create allocations for declared tensors (without initial data).
-    val valueAllocations = allValueProtos
+    val valueAllocations: Either[String, List[Allocation]] = allValueProtos
       .distinctBy(_.name)
-      .foldLeft[Either[String, List[Allocation]]](Right(Nil)) { (acc, valueInfo) =>
-        for {
-          list <- acc
-          alloc <- createAllocation(valueInfo, maxBatchSize, None)
-        } yield alloc :: list
-      }
-      .map(_.reverse)
+      .toList
+      .traverse(valueInfo => createAllocation(valueInfo, None))
 
     // Create allocations for constant tensors, which include initial data.
-    val initializerAllocations =
-      graph.initializer.foldLeft[Either[String, List[Allocation]]](Right(Nil)) {
-        (acc, tensorProto) =>
-          for {
-            list <- acc
-            alloc <- createAllocationFromInitializer(tensorProto)
-          } yield alloc :: list
-      }
+    val initializerAllocations: Either[String, List[Allocation]] =
+      graph.initializer.toList.traverse(createAllocationFromInitializer)
 
     for {
       valAllocs <- valueAllocations
@@ -180,7 +161,6 @@ object Translator {
     */
   private def createAllocation(
       valueInfo: ValueInfoProto,
-      maxBatchSize: Int,
       initialData: Option[Array[Byte]],
   ): Either[String, Allocation] =
     for {
@@ -195,7 +175,7 @@ object Translator {
       }
       dataType <- fromOnnxDataType(tensorType.elemType)
       shapeProto <- tensorType.shape.toRight(s"Tensor '$name' has no shape")
-      shape = parseShape(shapeProto, maxBatchSize)
+      shape <- parseShape(shapeProto)
     } yield Allocation(name, dataType, shape, initialData)
 
   /** Creates an `Allocation` from a constant tensor (`TensorProto`). This is used for weights and
@@ -211,18 +191,30 @@ object Translator {
       data <- extractBytes(tensor, dataType)
     } yield Allocation(name, dataType, shape, Some(data))
 
-  /** Converts an ONNX `TensorShapeProto` into a `List[Int]`. It replaces dynamic dimensions
-    * (represented by `DimParam` or `Empty`) with the static `maxBatchSize`.
+  /** Converts an ONNX `TensorShapeProto` into a `List[Int]`.
     */
-  private def parseShape(shapeProto: TensorShapeProto, maxBatchSize: Int): List[Int] =
-    shapeProto.dim.map { dim =>
+  private def parseShape(shapeProto: TensorShapeProto): Either[String, List[Int]] =
+    // `traverse` will attempt to convert each dimension. If any dimension fails
+    // (returns a Left), the entire operation will fail and return that Left.
+    shapeProto.dim.toList.traverse { dim =>
       dim.value match {
-        case TensorShapeProto.Dimension.Value.DimParam(_) => maxBatchSize
-        case TensorShapeProto.Dimension.Value.DimValue(value) => value.toInt
+        // The success case: the dimension has a fixed integer value.
+        case TensorShapeProto.Dimension.Value.DimValue(value) =>
+          Right(value.toInt)
+
+        // The failure case: the dimension is a named parameter (e.g., 'N' or 'batch_size').
+        case TensorShapeProto.Dimension.Value.DimParam(name) =>
+          Left(
+            s"Model uses a dynamic dimension parameter ('$name'). This translator requires static shapes and does not handle dynamic inputs.",
+          )
+
+        // The failure case: the dimension is unspecified.
         case TensorShapeProto.Dimension.Value.Empty =>
-          maxBatchSize // Treat empty/unknown dimension as dynamic
+          Left(
+            "Model has an unknown dimension. This translator requires static shapes.",
+          )
       }
-    }.toList
+    }
 
   /** Maps an ONNX integer data type code to the corresponding IR `DataType`. */
   private def fromOnnxDataType(onnxType: Int): Either[String, DataType] =
