@@ -62,7 +62,7 @@ object Translator {
   /** Validates that an ONNX node has the expected number of inputs and outputs. This prevents
     * runtime errors from unsafe access like `.head` or `(1)`.
     */
-  private def checkArity(
+  private[onnx] def checkArity(
       node: NodeProto,
       expectedInputs: Int,
       expectedOutputs: Int,
@@ -78,7 +78,7 @@ object Translator {
   /** Gathers all tensor definitions from the graph and creates a map of named `Allocation` objects.
     * This includes inputs, outputs, constant initializers, and intermediate tensors.
     */
-  private def buildAllocations(
+  private[onnx] def buildAllocations(
       graph: GraphProto,
   ): Either[String, Map[String, Allocation]] = {
     // Collect all tensor *declarations* (which define shape and type).
@@ -102,7 +102,7 @@ object Translator {
 
   /** Translates a single ONNX `NodeProto` into its corresponding IR `Operation`.
     */
-  private def translateNode(node: NodeProto): Either[String, Operation] = {
+  private[onnx] def translateNode(node: NodeProto): Either[String, Operation] = {
     val attributes = new OnnxAttributeHelper(node)
     node.opType match {
       // Group simple binary operators
@@ -159,7 +159,7 @@ object Translator {
   /** Creates an `Allocation` from a tensor declaration (`ValueInfoProto`). This is used for tensors
     * whose memory must be allocated but whose initial value is not known.
     */
-  private def createAllocation(
+  private[onnx] def createAllocation(
       valueInfo: ValueInfoProto,
       initialData: Option[Array[Byte]],
   ): Either[String, Allocation] =
@@ -181,7 +181,7 @@ object Translator {
   /** Creates an `Allocation` from a constant tensor (`TensorProto`). This is used for weights and
     * biases, and includes extracting the raw byte data.
     */
-  private def createAllocationFromInitializer(
+  private[onnx] def createAllocationFromInitializer(
       tensor: TensorProto,
   ): Either[String, Allocation] =
     for {
@@ -193,7 +193,7 @@ object Translator {
 
   /** Converts an ONNX `TensorShapeProto` into a `List[Int]`.
     */
-  private def parseShape(shapeProto: TensorShapeProto): Either[String, List[Int]] =
+  private[onnx] def parseShape(shapeProto: TensorShapeProto): Either[String, List[Int]] =
     // `traverse` will attempt to convert each dimension. If any dimension fails
     // (returns a Left), the entire operation will fail and return that Left.
     shapeProto.dim.toList.traverse { dim =>
@@ -217,7 +217,7 @@ object Translator {
     }
 
   /** Maps an ONNX integer data type code to the corresponding IR `DataType`. */
-  private def fromOnnxDataType(onnxType: Int): Either[String, DataType] =
+  private[onnx] def fromOnnxDataType(onnxType: Int): Either[String, DataType] =
     onnxType match {
       case 1 => Right(DataType.Float32)
       case 11 => Right(DataType.Float64)
@@ -239,7 +239,7 @@ object Translator {
     * `rawData` field. If that's empty, it falls back to reconstructing the byte array from typed
     * data fields (e.g., `floatData`).
     */
-  private def extractBytes(
+  private[onnx] def extractBytes(
       tensor: TensorProto,
       dataType: DataType,
   ): Either[String, Array[Byte]] =
