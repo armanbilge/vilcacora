@@ -39,6 +39,7 @@ lazy val onnx = project
       "org.typelevel" %%% "cats-core" % CatsVersion,
       "org.scalameta" %%% "munit" % MunitVersion % Test,
     ),
+    nativeConfig ~= { _.withEmbedResources(true) },
     Compile / PB.generate := (Compile / PB.generate).dependsOn(Compile / downloadOnnxProto).value,
     Compile / PB.targets := Seq(
       scalapb.gen() -> (Compile / sourceManaged).value / "scalapb",

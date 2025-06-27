@@ -20,7 +20,7 @@ import com.armanbilge.vilcacora.ir.{DataType, Operation, PostTransform, SVMKerne
 import vilcacora.onnx.proto.{AttributeProto, ModelProto, NodeProto}
 import com.google.protobuf.ByteString
 import munit.FunSuite
-import java.nio.file.{Files, Paths}
+import java.io.InputStream
 
 class TranslatorSuite extends FunSuite {
 
@@ -100,13 +100,16 @@ class TranslatorSuite extends FunSuite {
 
   // Helper now includes the leading slash, which is the correct way to specify an absolute path on the classpath
   def loadModelFromPath(modelPath: String): ModelProto = {
-    val bytes = Files.readAllBytes(Paths.get(modelPath))
-    ModelProto.parseFrom(bytes)
+    val stream: InputStream = getClass.getResourceAsStream(modelPath)
+    if (stream == null)
+      throw new IllegalArgumentException(s"Resource not found: $modelPath")
+    try ModelProto.parseFrom(stream)
+    finally stream.close()
   }
 
   test("translate should successfully process a valid, fully static model") {
     // This test now depends on the file 'static_svm.onnx' being in 'onnx/src/test/resources'
-    val modelProto = loadModelFromPath("onnx/src/test/resources/static_svm.onnx")
+    val modelProto = loadModelFromPath("/static_svm.onnx")
     val irResult = Translator.translate(modelProto)
 
     assert(irResult.isRight, "Translation failed unexpectedly for a valid model")
@@ -118,7 +121,7 @@ class TranslatorSuite extends FunSuite {
 
   test("translate should fail gracefully for a model with dynamic shapes") {
     // This test now depends on the file 'dynamic_svm.onnx' being in 'onnx/src/test/resources'
-    val modelProto = loadModelFromPath("onnx/src/test/resources/dynamic_svm.onnx")
+    val modelProto = loadModelFromPath("/dynamic_svm.onnx")
     val irResult = Translator.translate(modelProto)
 
     assert(irResult.isLeft, "Translation should have failed but it succeeded")
