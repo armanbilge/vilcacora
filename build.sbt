@@ -18,7 +18,8 @@ ThisBuild / githubWorkflowBuildPreamble +=
 ThisBuild / githubWorkflowBuildPreamble ++= nativeBrewInstallWorkflowSteps.value
 
 val CatsEffectVersion = "3.7-8f2b497"
-
+val CatsVersion = "2.12.0"
+val MunitVersion = "1.0.4"
 lazy val root = tlCrossRootProject.aggregate(ir, onnx, runtime)
 
 lazy val ir = project
@@ -35,7 +36,10 @@ lazy val onnx = project
     name := "vilcacora-onnx",
     libraryDependencies ++= Seq(
       "com.thesamet.scalapb" %% "scalapb-runtime" % scalapb.compiler.Version.scalapbVersion % "protobuf",
+      "org.typelevel" %%% "cats-core" % CatsVersion,
+      "org.scalameta" %%% "munit" % MunitVersion % Test,
     ),
+    nativeConfig ~= { _.withEmbedResources(true) },
     Compile / PB.generate := (Compile / PB.generate).dependsOn(Compile / downloadOnnxProto).value,
     Compile / PB.targets := Seq(
       scalapb.gen() -> (Compile / sourceManaged).value / "scalapb",
@@ -64,6 +68,8 @@ lazy val runtime = project
     name := "vilcacora-runtime",
     libraryDependencies ++= Seq(
       "org.typelevel" %%% "cats-effect-kernel" % CatsEffectVersion,
+      "org.typelevel" %%% "cats-core" % CatsVersion,
+      "org.scalameta" %%% "munit" % MunitVersion % Test,
     ),
     nativeBrewFormulas ++= Set("openblas", "mlpack"),
   )
