@@ -14,40 +14,52 @@
  * limitations under the License.
  */
 
-
-
 package vilcacora.runtime
 
 import scala.scalanative.unsafe._
 import scala.scalanative.unsigned._
-
 
 @link("mlpack")
 @link("openblas")
 @extern object NativeOnnxOps {
 
   def onnx_add_matrix_double(
-      A_data: Ptr[CDouble], rowsA: CSize, colsA: CSize,
-      B_data: Ptr[CDouble], rowsB: CSize, colsB: CSize,
-      C_data: Ptr[CDouble]): Unit = extern
+      A_data: Ptr[CDouble],
+      rowsA: CSize,
+      colsA: CSize,
+      B_data: Ptr[CDouble],
+      rowsB: CSize,
+      colsB: CSize,
+      C_data: Ptr[CDouble],
+  ): Unit = extern
 
   def onnx_mul_matrix_double(
-      A_data: Ptr[CDouble], rowsA: CSize, colsA: CSize,
-      B_data: Ptr[CDouble], rowsB: CSize, colsB: CSize,
-      D_data: Ptr[CDouble]): Unit = extern
+      A_data: Ptr[CDouble],
+      rowsA: CSize,
+      colsA: CSize,
+      B_data: Ptr[CDouble],
+      rowsB: CSize,
+      colsB: CSize,
+      D_data: Ptr[CDouble],
+  ): Unit = extern
 
   def onnx_cast_double_to_float(
-      input_data: Ptr[CDouble], rows: CSize, cols: CSize,
-      output_data: Ptr[CFloat]): Unit = extern
+      input_data: Ptr[CDouble],
+      rows: CSize,
+      cols: CSize,
+      output_data: Ptr[CFloat],
+  ): Unit = extern
 
   def onnx_cast_float_to_double(
-      input_data: Ptr[CFloat], rows: CSize, cols: CSize,
-      output_data: Ptr[CDouble]): Unit = extern
+      input_data: Ptr[CFloat],
+      rows: CSize,
+      cols: CSize,
+      output_data: Ptr[CDouble],
+  ): Unit = extern
 }
 
-
 object Main {
-  def main(args: Array[String]): Unit = {
+  def main(args: Array[String]): Unit =
     Zone { implicit z =>
       println("Calling C++ mlpack/Armadillo for ONNX operations from Scala Native...")
 
@@ -96,9 +108,13 @@ object Main {
       println("\n--- Performing ONNX Add ---")
       val resultAddPtr = alloc[CDouble](size)
       NativeOnnxOps.onnx_add_matrix_double(
-        ptrA, rows.toCSize, cols.toCSize,
-        ptrB, rows.toCSize, cols.toCSize,
-        resultAddPtr
+        ptrA,
+        rows.toCSize,
+        cols.toCSize,
+        ptrB,
+        rows.toCSize,
+        cols.toCSize,
+        resultAddPtr,
       )
       val resultAddArray = Array.ofDim[Double](size)
       for (i <- 0 until size) resultAddArray(i) = !(resultAddPtr + i)
@@ -107,9 +123,13 @@ object Main {
       println("\n--- Performing ONNX Mul ---")
       val resultMulPtr = alloc[CDouble](size)
       NativeOnnxOps.onnx_mul_matrix_double(
-        ptrA, rows.toCSize, cols.toCSize,
-        ptrB, rows.toCSize, cols.toCSize,
-        resultMulPtr
+        ptrA,
+        rows.toCSize,
+        cols.toCSize,
+        ptrB,
+        rows.toCSize,
+        cols.toCSize,
+        resultMulPtr,
       )
       val resultMulArray = Array.ofDim[Double](size)
       for (i <- 0 until size) resultMulArray(i) = !(resultMulPtr + i)
@@ -122,8 +142,10 @@ object Main {
 
       val resultCastFloatPtr = alloc[CFloat](size)
       NativeOnnxOps.onnx_cast_double_to_float(
-        inputCastDoublePtr, rows.toCSize, cols.toCSize,
-        resultCastFloatPtr
+        inputCastDoublePtr,
+        rows.toCSize,
+        cols.toCSize,
+        resultCastFloatPtr,
       )
       val resultCastFloatArray = Array.ofDim[Float](size)
       for (i <- 0 until size) resultCastFloatArray(i) = !(resultCastFloatPtr + i)
@@ -137,14 +159,14 @@ object Main {
 
       val resultCastDoublePtr = alloc[CDouble](size)
       NativeOnnxOps.onnx_cast_float_to_double(
-        inputCastFloatPtr, rows.toCSize, cols.toCSize,
-        resultCastDoublePtr
+        inputCastFloatPtr,
+        rows.toCSize,
+        cols.toCSize,
+        resultCastDoublePtr,
       )
       val resultCastDoubleArray = Array.ofDim[Double](size)
       for (i <- 0 until size) resultCastDoubleArray(i) = !(resultCastDoublePtr + i)
       printFloatMatrix("Input Float Matrix", inputCastFloat.map(_.toFloat), rows, cols)
       printMatrix("Result Double Matrix", resultCastDoubleArray, rows, cols)
     }
-  }
 }
-
