@@ -16,7 +16,7 @@
 
 
 
-package com.armanbilge.runtime
+package vilcacora.runtime
 
 import scala.scalanative.unsafe._
 import scala.scalanative.unsigned._
