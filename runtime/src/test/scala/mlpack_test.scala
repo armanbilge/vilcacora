@@ -60,7 +60,7 @@ import scala.scalanative.unsigned._
 
 object Main {
   def main(args: Array[String]): Unit =
-    Zone { implicit z:Zone =>
+    Zone { implicit z: Zone =>
       println("Calling C++ mlpack/Armadillo for ONNX operations from Scala Native...")
 
       def printMatrix(name: String, data: Array[Double], rows: Int, cols: Int): Unit = {
