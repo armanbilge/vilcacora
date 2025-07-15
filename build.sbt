@@ -65,13 +65,13 @@ lazy val onnx = project
 
 lazy val runtime = project
   .enablePlugins(ScalaNativePlugin, ScalaNativeBrewedConfigPlugin)
-  .dependsOn(ir)
+  .dependsOn(ir, onnx)
   .settings(
     name := "vilcacora-runtime",
     libraryDependencies ++= Seq(
-      "org.typelevel" %%% "cats-effect-kernel" % CatsEffectVersion,
+      "org.typelevel" %%% "cats-effect" % CatsEffectVersion,
       "org.typelevel" %%% "cats-core" % CatsVersion,
       "org.scalameta" %%% "munit" % MunitVersion % Test,
     ),
-    nativeBrewFormulas ++= Set("openblas", "mlpack"),
+    nativeBrewFormulas ++= Set("openblas", "mlpack", "libsvm"),
   )
