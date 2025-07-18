@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,6 +24,7 @@ import scala.scalanative.unsafe._
 import scala.scalanative.libc.stdlib
 import scala.scalanative.libc.string.memcpy
 import scala.scalanative.unsigned._
+import scala.collection.mutable.ListBuffer
 
 /** The core execution engine for a translated `ModelIR`. It manages memory and executes operations
   * within a Cats Effect IO context.
@@ -34,37 +35,65 @@ object Interpreter {
   type MemoryMap = Map[String, Ptr[Byte]]
 
   /** Executes a complete ModelIR graph from inputs to outputs. */
-  def execute(model: ModelIR, inputs: Map[String, Array[_]]): IO[Map[String, Array[_]]] =
-    // `Resource.use` guarantees all tensor memory is pre-allocated and safely freed.
-    memoryResource(model).use { memoryMap =>
-      for {
-        _ <- copyInputsToMemory(inputs, model, memoryMap)
+  def execute(model: ModelIR, inputs: Map[String, Array[_]]): IO[Map[String, Array[_]]] = {
+    // Pre-allocate Scala arrays that will hold the final results.
+    // The execution engine will write directly into the memory of these arrays.
+    val outputArrays = createOutputArrays(model)
 
-        // The core execution loop. It executes each operation and then yields control
-        // to the Cats Effect runtime to maintain application responsiveness.
-        // This is the desired structure.
-        _ <- model.operations.traverse_ { op =>
-          executeOperation(op, memoryMap, model) <* IO.cede
-        }
+    // `Resource.use` guarantees that natively-allocated memory for intermediate
+    // tensors is safely freed, while inputs and outputs use zero-copy pointers.
+    memoryResource(model, inputs, outputArrays).use { memoryMap =>
+      // The core execution loop. It executes each operation and then yields control
+      // to the Cats Effect runtime to maintain application responsiveness.
+      model.operations.traverse_ { op =>
+        executeOperation(op, memoryMap, model) <* IO.cede
+      }
+    }.as(outputArrays) // Return the populated output arrays.
+  }
 
-        results <- copyOutputsFromMemory(model, memoryMap)
-      } yield results
-    }
+  /** A `Resource` that manages memory for the graph execution.
+    *
+    * - **Inputs/Outputs**: Obtains direct pointers to the provided Scala arrays (zero-copy).
+    * - **Intermediates/Constants**: Allocates native memory via `malloc` and ensures it's freed.
+    */
+  private def memoryResource(
+      model: ModelIR,
+      inputs: Map[String, Array[_]],
+      outputs: Map[String, Array[_]],
+  ): Resource[IO, MemoryMap] = {
+    val acquire = IO {
+      val mallocedPtrs = ListBuffer.empty[Ptr[Byte]]
+      val memoryMap = model.allocations.map { case (name, allocation) =>
+        val ptr: Ptr[Byte] =
+          if (inputs.contains(name)) {
+            // For inputs, get a direct pointer to the Scala array's memory.
+            inputs(name).at(0).asInstanceOf[Ptr[Byte]]
+          } else if (outputs.contains(name)) {
+            // For outputs, get a direct pointer to the pre-allocated Scala array's memory.
+            outputs(name).at(0).asInstanceOf[Ptr[Byte]]
+          } else {
+            // For intermediates and constants, allocate native memory.
+            val totalBytes = (allocation.shape.product * allocation.dataType.sizeInBytes).toUSize
+            val p = stdlib.malloc(totalBytes)
+            if (p == null) throw new OutOfMemoryError(s"Failed to allocate tensor '$name'")
 
-  /** A `Resource` that manages the lifecycle of all tensor memory for the graph. */
-  private def memoryResource(model: ModelIR): Resource[IO, MemoryMap] = {
-    val allocAll = IO {
-      model.allocations.map { case (name, allocation) =>
-        val totalBytes = (allocation.shape.product * allocation.dataType.sizeInBytes).toUSize
-        val ptr = stdlib.malloc(totalBytes)
-        if (ptr == null) throw new OutOfMemoryError(s"Failed to allocate tensor '$name'")
-        allocation.initialData.foreach(data =>
-          memcpy(ptr, data.at(0).asInstanceOf[Ptr[Byte]], data.length.toUSize),
-        )
+            // Copy any initial data (e.g., for constants).
+            allocation.initialData.foreach(data =>
+              memcpy(p, data.at(0).asInstanceOf[Ptr[Byte]], data.length.toUSize),
+            )
+            mallocedPtrs += p
+            p
+          }
         name -> ptr
       }
+      (memoryMap.toMap, mallocedPtrs.toList)
     }
-    Resource.make(allocAll)(memoryMap => IO(memoryMap.values.foreach(stdlib.free))).map(_.toMap)
+
+    Resource.make(acquire) { case (_, ptrsToFree) =>
+      // The release action only frees the memory we explicitly `malloc`'d.
+      // Memory for input/output arrays is managed by the Scala GC.
+      IO(ptrsToFree.foreach(stdlib.free))
+    }.map(_._1)
   }
 
   /** Executes a single operation by dispatching to the appropriate handler. */
@@ -162,7 +191,7 @@ object Interpreter {
           (predictedLabel, decisionValuesPtr, decValuesCount)
         }
 
-        // 4. Deconstruct the results and copy them to their output tensors.
+        // 4. Deconstruct the results and write them directly to the output tensor memory.
         (predictedLabel, decisionValuesPtr, decValuesCount) = predictionResult
         _ <- IO {
           val labelOutputPtr = memory(op.outputLabel).asInstanceOf[Ptr[CInt]]
@@ -236,14 +265,11 @@ object Interpreter {
       coefRows.zipWithIndex.foreach { case (coefRowPtr, i) =>
         !(svCoefs + i) = coefRowPtr
         for (j <- 0 until numSupportVectors) {
-          // ==========================================================
-
           // ONNX coefficients are flat with shape [(nr_class-1), num_support_vectors].
           // `i` is the class-pair index, `j` is the support-vector index.
           // This formula correctly accesses the flat array in row-major order.
           val index = i * numSupportVectors + j
           !(coefRowPtr + j) = op.coefficients(index)
-          // ==========================================================
         }
       }
 
@@ -259,47 +285,18 @@ object Interpreter {
     }
   }
 
-  /** Copies input Scala Arrays into their corresponding pre-allocated C memory. */
-  private def copyInputsToMemory(
-      inputs: Map[String, Array[_]],
-      model: ModelIR,
-      memory: MemoryMap,
-  ): IO[Unit] = IO {
-    inputs.foreach { case (name, dataArray) =>
-      val ptr = memory.getOrElse(
-        name,
-        throw new NoSuchElementException(s"Input tensor '$name' not found in memory map"),
-      )
-      (dataArray, model.allocations(name).dataType) match {
-        case (data: Array[Float], DataType.Float32) =>
-          memcpy(ptr, data.at(0).asInstanceOf[Ptr[Byte]], data.length.toUSize * sizeof[CFloat])
-        case (data: Array[Double], DataType.Float64) =>
-          memcpy(ptr, data.at(0).asInstanceOf[Ptr[Byte]], data.length.toUSize * sizeof[CDouble])
-        case (data: Array[Int], DataType.Int32) =>
-          memcpy(ptr, data.at(0).asInstanceOf[Ptr[Byte]], data.length.toUSize * sizeof[CInt])
-        case (data: Array[Long], DataType.Int64) =>
-          memcpy(ptr, data.at(0).asInstanceOf[Ptr[Byte]], data.length.toUSize * sizeof[CLong])
-        case (_, dt) =>
-          throw new ClassCastException(s"Input data type mismatch for '$name', expected $dt")
+  /** Creates empty Scala arrays for each graph output, ready to be written to directly. */
+  private def createOutputArrays(model: ModelIR): Map[String, Array[_]] =
+    model.graphOutputs.map { name =>
+      val allocation = model.allocations(name)
+      val size = allocation.shape.product
+      val array: Array[_] = allocation.dataType match {
+        case DataType.Float32 => new Array[Float](size)
+        case DataType.Int32 => new Array[Int](size)
+        case DataType.Float64 => new Array[Double](size)
+        case DataType.Int64 => new Array[Long](size)
+        case other => throw new Exception(s"Unsupported output data type: $other")
       }
-    }
-  }
-
-  /** Copies final results from C memory back into new Scala Arrays. */
-  private def copyOutputsFromMemory(model: ModelIR, memory: MemoryMap): IO[Map[String, Array[_]]] =
-    IO {
-      model.graphOutputs.map { name =>
-        val allocation = model.allocations(name)
-        val ptr = memory(name)
-        val size = allocation.shape.product
-        val array: Array[_] = allocation.dataType match {
-          case DataType.Float32 => Array.tabulate(size)(i => !(ptr.asInstanceOf[Ptr[CFloat]] + i))
-          case DataType.Int32 => Array.tabulate(size)(i => !(ptr.asInstanceOf[Ptr[CInt]] + i))
-          case DataType.Float64 => Array.tabulate(size)(i => !(ptr.asInstanceOf[Ptr[CDouble]] + i))
-          case DataType.Int64 => Array.tabulate(size)(i => !(ptr.asInstanceOf[Ptr[CLong]] + i))
-          case other => throw new Exception(s"Unsupported output data type: $other")
-        }
-        name -> array
-      }.toMap
-    }
+      name -> array
+    }.toMap
 }

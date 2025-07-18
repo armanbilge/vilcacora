@@ -103,7 +103,7 @@ object Translator {
       existingAllocs = (valAllocs ++ initAllocs).map(a => a.name -> a).toMap
 
       // Iterate through all nodes to find any that need special handling.
-      newAllocs <- graph.node.toList.traverse { node =>
+      newAllocs <- graph.node.toList.flatTraverse { node =>
         node.opType match {
           case "SVMClassifier" =>
             for {
@@ -149,7 +149,7 @@ object Translator {
             Right(List.empty[Allocation])
         }
       }
-    } yield newAllocs.flatten
+    } yield newAllocs
 
     for {
       valAllocs <- valueAllocations
