@@ -93,11 +93,69 @@ object Translator {
     // Create allocations for constant tensors, which include initial data.
     val initializerAllocations: Either[String, List[Allocation]] =
       graph.initializer.toList.traverse(createAllocationFromInitializer)
+    // This new section manually creates allocations for intermediate tensors
+    // that are not explicitly declared in the ONNX graph's value_info.
+
+    val manuallyCreatedAllocs = for {
+      valAllocs <- valueAllocations
+      initAllocs <- initializerAllocations
+      // Create a temporary map of all known allocations so far for lookups.
+      existingAllocs = (valAllocs ++ initAllocs).map(a => a.name -> a).toMap
+
+      // Iterate through all nodes to find any that need special handling.
+      newAllocs <- graph.node.toList.flatTraverse { node =>
+        node.opType match {
+          case "SVMClassifier" =>
+            for {
+              _ <- checkArity(node, 1, 2) // Ensure SVMClassifier has 2 outputs
+              scoresOutputName = node.output(1)
+              // Check if an allocation for the scores tensor already exists.
+              allocations <-
+                if (existingAllocs.contains(scoresOutputName)) {
+                  // If it exists, we don't need to do anything.
+                  Right(List.empty[Allocation])
+                } else {
+                  // If it doesn't exist, create it manually.
+                  for {
+                    // Get the input tensor's allocation to infer the batch size.
+                    inputAlloc <- existingAllocs
+                      .get(node.input.head)
+                      .toRight(
+                        s"SVM input '${node.input.head}' not found in allocations.",
+                      )
+                    batchSize <- inputAlloc.shape.headOption.toRight(
+                      s"Input '${inputAlloc.name}' for SVM has no dimensions.",
+                    )
+
+                    // Get the number of classes from the node's attributes.
+                    attributes = new OnnxAttributeHelper(node)
+                    classLabels <- attributes.getInts("classlabels_ints")
+                    numClasses = classLabels.size
+
+                    // The ONNX spec defines the scores output as a float tensor.
+                    // We default to Float32. Shape is [batch_size, num_classes].
+                    scoresAlloc = Allocation(
+                      name = scoresOutputName,
+                      dataType = DataType.Float32,
+                      shape = List(batchSize.toInt, numClasses),
+                      initialData = None,
+                    )
+                  } yield List(scoresAlloc)
+                }
+            } yield allocations
+
+          case _ =>
+            // For all other operators, we assume their outputs are properly declared.
+            Right(List.empty[Allocation])
+        }
+      }
+    } yield newAllocs
 
     for {
       valAllocs <- valueAllocations
       initAllocs <- initializerAllocations
-    } yield (valAllocs ++ initAllocs).map(a => a.name -> a).toMap
+      manualAllocs <- manuallyCreatedAllocs
+    } yield (valAllocs ++ initAllocs ++ manualAllocs).map(a => a.name -> a).toMap
   }
 
   /** Translates a single ONNX `NodeProto` into its corresponding IR `Operation`.
@@ -223,8 +281,8 @@ object Translator {
       case 11 => Right(DataType.Float64)
       case 10 => Right(DataType.Float16)
       case 16 => Right(DataType.BFloat16)
-      case 7 => Right(DataType.Int32)
-      case 6 => Right(DataType.Int64)
+      case 6 => Right(DataType.Int32)
+      case 7 => Right(DataType.Int64)
       case 5 => Right(DataType.Int16)
       case 3 => Right(DataType.Int8)
       case 12 => Right(DataType.UInt32)
@@ -256,8 +314,8 @@ object Translator {
       tensor.dataType match {
         case 1 => tensor.floatData.foreach(buffer.putFloat)
         case 11 => tensor.doubleData.foreach(buffer.putDouble)
-        case 7 => tensor.int32Data.foreach(buffer.putInt)
-        case 6 => tensor.int64Data.foreach(buffer.putLong)
+        case 6 => tensor.int32Data.foreach(buffer.putInt)
+        case 7 => tensor.int64Data.foreach(buffer.putLong)
         // Note: Other types like int16 are typically stored in `rawData` or `int32Data`.
         case unsupportedType =>
           return Left(
