@@ -100,8 +100,8 @@ object Interpreter {
   private def executeOperation(op: Operation, memory: MemoryMap, model: ModelIR): IO[Unit] =
     op match {
       case op: Operation.SVMClassifier => handleSvmClassifier(op, memory, model)
-      case op: Operation.Add => handleElementWise(op, memory, model)(_ + _)
-      case op: Operation.Mul => handleElementWise(op, memory, model)(_ * _)
+      case op: Operation.Add => handleAdd(op, memory, model)
+      case op: Operation.Mul => handleMul(op, memory, model)
       case op: Operation.Cast => handleCast(op, memory, model)
       case other =>
         IO.raiseError(
@@ -111,18 +111,34 @@ object Interpreter {
 
   // --- Operation Handlers ---
 
-  private def handleElementWise(op: Operation, memory: MemoryMap, model: ModelIR)(
-      f: (Float, Float) => Float,
-  ): IO[Unit] = IO {
+  private def handleAdd(op: Operation.Add, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
     val outputAllocation = model.allocations(op.outputs.head)
     val count = outputAllocation.shape.product
 
     val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CFloat]]
     val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CFloat]]
-    val output = memory(op.outputs(0)).asInstanceOf[Ptr[CFloat]]
+    val output = memory(op.outputs.head).asInstanceOf[Ptr[CFloat]]
 
-    for (i <- 0 until count)
-      !(output + i) = f(!(inputA + i), !(inputB + i))
+    var i = 0
+    while (i < count) {
+      !(output + i) = !(inputA + i) + !(inputB + i)
+      i += 1
+    }
+  }
+
+  private def handleMul(op: Operation.Mul, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
+    val outputAllocation = model.allocations(op.outputs.head)
+    val count = outputAllocation.shape.product
+
+    val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CFloat]]
+    val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CFloat]]
+    val output = memory(op.outputs.head).asInstanceOf[Ptr[CFloat]]
+
+    var i = 0
+    while (i < count) {
+      !(output + i) = !(inputA + i) * !(inputB + i)
+      i += 1
+    }
   }
 
   private def handleCast(op: Operation.Cast, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
@@ -135,17 +151,25 @@ object Interpreter {
 
     (inputAlloc.dataType, outputAlloc.dataType) match {
       case (from, to) if from == to =>
+        // This is a copy operation between tensors of the same type.
+        // Making it a no op is giving wrong result.
         val _ = memcpy(outputPtr, inputPtr, (count * from.sizeInBytes).toUSize)
       case (DataType.Float64, DataType.Float32) =>
         val in = inputPtr.asInstanceOf[Ptr[CDouble]]
         val out = outputPtr.asInstanceOf[Ptr[CFloat]]
-        for (i <- 0 until count)
+        var i = 0
+        while (i < count) {
           !(out + i) = (!(in + i)).toFloat
+          i += 1
+        }
       case (DataType.Float32, DataType.Float64) =>
         val in = inputPtr.asInstanceOf[Ptr[CFloat]]
         val out = outputPtr.asInstanceOf[Ptr[CDouble]]
-        for (i <- 0 until count)
+        var i = 0
+        while (i < count) {
           !(out + i) = (!(in + i)).toDouble
+          i += 1
+        }
       // Add more cases for other data types
       case (from, to) =>
         throw new NotImplementedError(s"Cast from $from to $to is not implemented.")
@@ -174,10 +198,12 @@ object Interpreter {
         // This entire block is now a single IO action that performs the C interop.
         predictionResult <- IO {
           // 1. Fill the svm_node struct with input data from the input tensor.
-          for (i <- 0 until numFeatures) {
+          var i = 0
+          while (i < numFeatures) {
             val node = svmInputNode + i
             node.index = i + 1 // LIBSVM indices are 1-based.
             node.value = !(inputPtr + i)
+            i += 1
           }
           (svmInputNode + numFeatures).index = -1 // Terminator node.
 
@@ -208,9 +234,18 @@ object Interpreter {
     }
   }
 
-  /** Helper to safely `malloc` memory within a `Resource` scope. */
+  /** Helper to safely `malloc` memory within a `Resource` scope. It checks for a `null` return
+    * and throws an `OutOfMemoryError` on failure.
+    */
   private def malloc[T](size: CSize): Resource[IO, Ptr[T]] =
-    Resource.make(IO(stdlib.malloc(size)))(ptr => IO(stdlib.free(ptr))).map(_.asInstanceOf[Ptr[T]])
+    Resource
+      .make(IO {
+        val p = stdlib.malloc(size)
+        if (p == null)
+          throw new OutOfMemoryError(s"Failed to allocate $size bytes of native memory")
+        p
+      })(ptr => IO(stdlib.free(ptr)))
+      .map(_.asInstanceOf[Ptr[T]])
 
   /** Constructs a `Ptr[svm_model]` from our IR, wrapped in a `Resource` for guaranteed memory
     * safety.
@@ -248,29 +283,46 @@ object Interpreter {
       param.coef0 = op.kernelParams.drop(1).headOption.getOrElse(0.0)
       param.degree = op.kernelParams.drop(2).headOption.map(_.toInt).getOrElse(3)
 
-      op.classLabels.zipWithIndex.foreach { case (l, i) => !(label + i) = l.toInt }
-      op.rho.zipWithIndex.foreach { case (r, i) => !(rho + i) = r }
-      op.vectorsPerClass.zipWithIndex.foreach { case (n, i) => !(nSV + i) = n.toInt }
+      var i = 0
+      while (i < op.classLabels.length) {
+        !(label + i) = op.classLabels(i).toInt; i += 1
+      }
+      i = 0
+      while (i < op.rho.length) {
+        !(rho + i) = op.rho(i); i += 1
+      }
+      i = 0
+      while (i < op.vectorsPerClass.length) {
+        !(nSV + i) = op.vectorsPerClass(i).toInt; i += 1
+      }
 
-      svRows.zipWithIndex.foreach { case (svRowPtr, i) =>
+      i = 0
+      while (i < svRows.length) {
+        val svRowPtr = svRows(i)
         !(svs + i) = svRowPtr
-        for (j <- 0 until numFeatures) {
+        var j = 0
+        while (j < numFeatures) {
           val node = svRowPtr + j
           node.index = j + 1
           node.value = op.supportVectors(i * numFeatures + j)
+          j += 1
         }
         (svRowPtr + numFeatures).index = -1
+        i += 1
       }
 
-      coefRows.zipWithIndex.foreach { case (coefRowPtr, i) =>
+      i = 0
+      while (i < coefRows.length) {
+        val coefRowPtr = coefRows(i)
         !(svCoefs + i) = coefRowPtr
-        for (j <- 0 until numSupportVectors) {
+        var j = 0
+        while (j < numSupportVectors) {
           // ONNX coefficients are flat with shape [(nr_class-1), num_support_vectors].
-          // `i` is the class-pair index, `j` is the support-vector index.
-          // This formula correctly accesses the flat array in row-major order.
           val index = i * numSupportVectors + j
           !(coefRowPtr + j) = op.coefficients(index)
+          j += 1
         }
+        i += 1
       }
 
       model.param = param
