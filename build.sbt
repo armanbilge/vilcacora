@@ -65,7 +65,7 @@ lazy val onnx = project
 
 lazy val runtime = project
   .enablePlugins(ScalaNativePlugin, ScalaNativeBrewedConfigPlugin)
-  .dependsOn(ir, onnx)
+  .dependsOn(ir)
   .settings(
     name := "vilcacora-runtime",
     libraryDependencies ++= Seq(

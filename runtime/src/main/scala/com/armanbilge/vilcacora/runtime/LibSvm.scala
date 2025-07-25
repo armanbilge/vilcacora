@@ -18,78 +18,45 @@ package com.armanbilge.vilcacora.runtime
 
 import scala.scalanative.unsafe._
 
-/** A safe, idiomatic Scala API for the LIBSVM C library. It provides type aliases, constants, and
-  * convenient accessors for the C structs, while isolating the raw C function bindings.
+/** A safe, idiomatic Scala API for the svm_wrapper.cpp
   */
-object LibSvm {
 
-  // --- Type Aliases for LIBSVM C Structs ---
-  // This is a concise way to define the memory layout of C structs in modern Scala Native.
-  type svm_node = CStruct2[CInt, CDouble]
-  type svm_parameter =
-    CStruct5[CInt, CInt, CInt, CDouble, CDouble] // Only fields needed for prediction
-  type svm_model = CStruct8[
-    Ptr[svm_parameter],
-    CInt, // nr_class
-    CInt, // l
-    Ptr[Ptr[svm_node]], // SV
-    Ptr[Ptr[CDouble]], // sv_coef
-    Ptr[CDouble], // rho
-    Ptr[CInt], // label
-    Ptr[CInt], // nSV
-  ]
+// Scala Native bindings for the C wrapper functions
+@link("svm")
+@extern
+object LibSVM {
+  // Model creation
+  def create_svm_param(
+      svm_type: CInt,
+      kernel_type: CInt,
+      degree: CInt,
+      gamma: CDouble,
+      coef0: CDouble,
+  ): Ptr[Byte] = extern
 
-  // --- LIBSVM Constants ---
-  // These are regular Scala vals, as they are part of our Scala API, not external C variables.
-  val LINEAR: CInt = 0
-  val POLY: CInt = 1
-  val RBF: CInt = 2
-  val SIGMOID: CInt = 3
+  def create_svm_model(
+      param: Ptr[Byte],
+      nr_class: CInt,
+      l: CInt,
+      support_vectors: Ptr[CDouble],
+      num_features: CInt,
+      coefficients: Ptr[CDouble],
+      rho: Ptr[CDouble],
+      class_labels: Ptr[CInt],
+      n_sv_per_class: Ptr[CInt],
+  ): Ptr[Byte] = extern
 
-  // --- Extension Methods for convenient, type-safe struct field access ---
+  // Prediction
+  def svm_predict_with_scores(
+      model: Ptr[Byte],
+      features: Ptr[CDouble],
+      num_features: CInt,
+      class_scores: Ptr[CDouble],
+  ): CInt = extern
 
-  implicit class SvmNodeOps(val ptr: Ptr[svm_node]) extends AnyVal {
-    def index: CInt = ptr._1; def index_=(v: CInt): Unit = ptr._1 = v
-    def value: CDouble = ptr._2; def value_=(v: CDouble): Unit = ptr._2 = v
-  }
+  // Debug function
+  def debug_model_info(model: Ptr[Byte]): Unit = extern
 
-  implicit class SvmParameterOps(val ptr: Ptr[svm_parameter]) extends AnyVal {
-    def svm_type: CInt = ptr._1; def svm_type_=(v: CInt): Unit = ptr._1 = v
-    def kernel_type: CInt = ptr._2; def kernel_type_=(v: CInt): Unit = ptr._2 = v
-    def degree: CInt = ptr._3; def degree_=(v: CInt): Unit = ptr._3 = v
-    def gamma: CDouble = ptr._4; def gamma_=(v: CDouble): Unit = ptr._4 = v
-    def coef0: CDouble = ptr._5; def coef0_=(v: CDouble): Unit = ptr._5 = v
-  }
-
-  implicit class SvmModelOps(val ptr: Ptr[svm_model]) extends AnyVal {
-    def param: Ptr[svm_parameter] = ptr._1; def param_=(v: Ptr[svm_parameter]): Unit = ptr._1 = v
-    def nr_class: CInt = ptr._2; def nr_class_=(v: CInt): Unit = ptr._2 = v
-    def l: CInt = ptr._3; def l_=(v: CInt): Unit = ptr._3 = v
-    def SV: Ptr[Ptr[svm_node]] = ptr._4; def SV_=(v: Ptr[Ptr[svm_node]]): Unit = ptr._4 = v
-    def sv_coef: Ptr[Ptr[CDouble]] = ptr._5; def sv_coef_=(v: Ptr[Ptr[CDouble]]): Unit = ptr._5 = v
-    def rho: Ptr[CDouble] = ptr._6; def rho_=(v: Ptr[CDouble]): Unit = ptr._6 = v
-    def label: Ptr[CInt] = ptr._7; def label_=(v: Ptr[CInt]): Unit = ptr._7 = v
-    def nSV: Ptr[CInt] = ptr._8; def nSV_=(v: Ptr[CInt]): Unit = ptr._8 = v
-  }
-
-  // --- Public API function that delegates to the C binding ---
-
-  /** Performs prediction and returns decision values (scores). */
-  def svm_predict_values(
-      model: Ptr[svm_model],
-      x: Ptr[svm_node],
-      dec_values: Ptr[CDouble],
-  ): CDouble = extern_functions.svm_predict_values(model, x, dec_values)
-
-  // --- Private, raw C bindings ---
-  // This object is marked @extern and only contains the raw function stubs.
-  @link("svm")
-  @extern
-  private object extern_functions {
-    def svm_predict_values(
-        model: Ptr[svm_model],
-        x: Ptr[svm_node],
-        dec_values: Ptr[CDouble],
-    ): CDouble = extern
-  }
+  // Use LibSVM's native cleanup function
+  def svm_free_and_destroy_model(model_ptr_ptr: Ptr[Ptr[Byte]]): Unit = extern
 }

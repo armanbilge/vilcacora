@@ -19,7 +19,7 @@ package com.armanbilge.vilcacora.runtime
 import cats.effect.{IO, Resource}
 import cats.syntax.all._
 import com.armanbilge.vilcacora.ir._
-import com.armanbilge.vilcacora.runtime.LibSvm._
+import com.armanbilge.vilcacora.runtime.LibSVM
 import scala.scalanative.unsafe._
 import scala.scalanative.libc.stdlib
 import scala.scalanative.libc.string.memcpy
@@ -47,17 +47,24 @@ object Interpreter {
     * @return
     *   An IO containing a map of output tensor names to their resulting Scala arrays.
     */
-  def execute(model: ModelIR, inputs: Map[String, Array[_]]): IO[Map[String, Array[_]]] = {
+  def execute(
+      model: ModelIR,
+      inputs: Map[String, Array[_]],
+  ): Resource[IO, IO[Map[String, Array[_]]]] = {
     validateModel(model)
+    val outputArrays: Map[String, Array[_]] = createOutputArrays(model)
 
-    val outputArrays = createOutputArrays(model)
-    memoryResource(model, inputs, outputArrays)
-      .use { memoryMap =>
-        model.operations.traverse_ { op =>
-          executeOperation(op, memoryMap, model) <* IO.cede
-        }
+    memoryResource(model, inputs, outputArrays).flatMap { memoryMap =>
+      val opResources: List[Resource[IO, IO[Unit]]] =
+        model.operations.map(op => executeOperation(op, memoryMap, model))
+
+      val combined: Resource[IO, List[IO[Unit]]] = opResources.sequence
+
+      combined.map { opIOs =>
+        val runOps: IO[Unit] = opIOs.traverse_(_ *> IO.cede)
+        runOps.as(outputArrays)
       }
-      .as(outputArrays)
+    }
   }
 
   /** Synchronously validates the model definition, throwing a `NotImplementedError` if any
@@ -125,43 +132,139 @@ object Interpreter {
   }
 
   /** Dispatches a single operation to its corresponding handler function. */
-  private def executeOperation(op: Operation, memory: MemoryMap, model: ModelIR): IO[Unit] =
+  private def executeOperation(
+      op: Operation,
+      memory: MemoryMap,
+      model: ModelIR,
+  ): Resource[IO, IO[Unit]] =
     op match {
       case op: Operation.SVMClassifier => handleSvmClassifier(op, memory, model)
-      case op: Operation.Add => handleAdd(op, memory, model)
-      case op: Operation.Mul => handleMul(op, memory, model)
-      case op: Operation.Cast => handleCast(op, memory, model)
+      case op: Operation.Add => Resource.pure(handleAdd(op, memory, model))
+      case op: Operation.Mul => Resource.pure(handleMul(op, memory, model))
+      case op: Operation.Cast => Resource.pure(handleCast(op, memory, model))
       case other =>
         // This case is unreachable due to the pre-validation step.
         // It remains as a safeguard against internal logic errors.
         throw new NotImplementedError(s"Operation not implemented: ${other.getClass.getSimpleName}")
     }
 
-  /** Handles element-wise addition for float tensors. */
+  /** Handles element-wise addition for both Float32 and Float64 tensors. */
   private def handleAdd(op: Operation.Add, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
     val count = model.allocations(op.outputs.head).shape.product
-    val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CFloat]]
-    val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CFloat]]
-    val output = memory(op.outputs.head).asInstanceOf[Ptr[CFloat]]
+    val inputAAlloc = model.allocations(op.inputs(0))
+    val inputBAlloc = model.allocations(op.inputs(1))
+    val outputAlloc = model.allocations(op.outputs.head)
 
-    var i = 0
-    while (i < count) {
-      !(output + i) = !(inputA + i) + !(inputB + i)
-      i += 1
+    // Verify all tensors have the same data type
+    require(
+      inputAAlloc.dataType == inputBAlloc.dataType &&
+        inputBAlloc.dataType == outputAlloc.dataType,
+      s"Add operation requires all tensors to have the same data type. " +
+        s"Got: ${inputAAlloc.dataType}, ${inputBAlloc.dataType}, ${outputAlloc.dataType}",
+    )
+
+    inputAAlloc.dataType match {
+      case DataType.Float32 =>
+        val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CFloat]]
+        val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CFloat]]
+        val output = memory(op.outputs.head).asInstanceOf[Ptr[CFloat]]
+
+        var i = 0
+        while (i < count) {
+          !(output + i) = !(inputA + i) + !(inputB + i)
+          i += 1
+        }
+
+      case DataType.Float64 =>
+        val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CDouble]]
+        val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CDouble]]
+        val output = memory(op.outputs.head).asInstanceOf[Ptr[CDouble]]
+
+        var i = 0
+        while (i < count) {
+          !(output + i) = !(inputA + i) + !(inputB + i)
+          i += 1
+        }
+
+      case DataType.Int32 =>
+        val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CInt]]
+        val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CInt]]
+        val output = memory(op.outputs.head).asInstanceOf[Ptr[CInt]]
+
+        var i = 0
+        while (i < count) {
+          !(output + i) = !(inputA + i) + !(inputB + i)
+          i += 1
+        }
+
+      case DataType.Int64 =>
+        val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CLongLong]]
+        val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CLongLong]]
+        val output = memory(op.outputs.head).asInstanceOf[Ptr[CLongLong]]
+
+        var i = 0
+        while (i < count) {
+          !(output + i) = !(inputA + i) + !(inputB + i)
+          i += 1
+        }
+
+      case unsupported =>
+        throw new NotImplementedError(s"Add operation not implemented for data type: $unsupported")
     }
   }
 
-  /** Handles element-wise multiplication for float tensors. */
+  /** Handles element-wise multiplication for both Float32 and Float64 tensors. */
   private def handleMul(op: Operation.Mul, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
     val count = model.allocations(op.outputs.head).shape.product
-    val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CFloat]]
-    val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CFloat]]
-    val output = memory(op.outputs.head).asInstanceOf[Ptr[CFloat]]
+    val inputAAlloc = model.allocations(op.inputs(0))
 
-    var i = 0
-    while (i < count) {
-      !(output + i) = !(inputA + i) * !(inputB + i)
-      i += 1
+    inputAAlloc.dataType match {
+      case DataType.Float32 =>
+        val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CFloat]]
+        val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CFloat]]
+        val output = memory(op.outputs.head).asInstanceOf[Ptr[CFloat]]
+
+        var i = 0
+        while (i < count) {
+          !(output + i) = !(inputA + i) * !(inputB + i)
+          i += 1
+        }
+
+      case DataType.Float64 =>
+        val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CDouble]]
+        val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CDouble]]
+        val output = memory(op.outputs.head).asInstanceOf[Ptr[CDouble]]
+
+        var i = 0
+        while (i < count) {
+          !(output + i) = !(inputA + i) * !(inputB + i)
+          i += 1
+        }
+
+      case DataType.Int32 =>
+        val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CInt]]
+        val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CInt]]
+        val output = memory(op.outputs.head).asInstanceOf[Ptr[CInt]]
+
+        var i = 0
+        while (i < count) {
+          !(output + i) = !(inputA + i) * !(inputB + i)
+          i += 1
+        }
+
+      case DataType.Int64 =>
+        val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CLongLong]]
+        val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CLongLong]]
+        val output = memory(op.outputs.head).asInstanceOf[Ptr[CLongLong]]
+
+        var i = 0
+        while (i < count) {
+          !(output + i) = !(inputA + i) * !(inputB + i)
+          i += 1
+        }
+
+      case unsupported =>
+        throw new NotImplementedError(s"Mul operation not implemented for data type: $unsupported")
     }
   }
 
@@ -204,150 +307,136 @@ object Interpreter {
   /** Handles the SVMClassifier operation by constructing a native LibSvm model, performing the
     * prediction, and writing the results to the output tensors.
     */
+  /** Handles the SVMClassifier operation using the C++ wrapper for robust LibSVM integration. This
+    * approach eliminates struct layout issues and provides ONNX-compliant per-class scores.
+    */
   private def handleSvmClassifier(
       op: Operation.SVMClassifier,
       memory: MemoryMap,
       model: ModelIR,
-  ): IO[Unit] = {
+  ): Resource[IO, IO[Unit]] = {
     val numFeatures = model.allocations(op.input).shape.last
 
-    val svmResources = for {
-      modelPtr <- buildSvmModelResource(op, numFeatures)
-      // Allocate native memory for the SVM input vector.
-      svmInputNode <- malloc[svm_node](sizeof[svm_node] * (numFeatures + 1).toUSize)
-    } yield (modelPtr, svmInputNode)
-
-    svmResources.use { case (modelPtr, svmInputNode) =>
+    // Create SVM model using C++ wrapper with proper resource management
+    createSvmModelResource(op, numFeatures).map { svmModel =>
       IO {
+        // Get input and output pointers from memory map
         val inputPtr = memory(op.input).asInstanceOf[Ptr[CDouble]]
+        val scoresPtr = memory(op.outputScores).asInstanceOf[Ptr[CDouble]]
+        val labelPtr = memory(op.outputLabel).asInstanceOf[Ptr[CInt]]
 
-        // Populate the svm_node array with feature data from the input tensor.
-        var i = 0
-        while (i < numFeatures) {
-          val node = svmInputNode + i
-          node.index = i + 1 // LibSvm is 1-based.
-          node.value = !(inputPtr + i)
-          i += 1
-        }
-        (svmInputNode + numFeatures).index = -1 // Add the terminator node.
-
-        // Predict and copy results back to the output tensors.
-        val nrClass = op.classLabels.size
-        val decValuesCount = nrClass * (nrClass - 1) / 2
-        val decisionValuesPtr = stackalloc[CDouble](decValuesCount.toUInt)
-        val predictedLabel = svm_predict_values(modelPtr, svmInputNode, decisionValuesPtr)
-
-        !memory(op.outputLabel).asInstanceOf[Ptr[CInt]] = predictedLabel.toInt
-        memcpy(
-          memory(op.outputScores).asInstanceOf[Ptr[CDouble]],
-          decisionValuesPtr.asInstanceOf[Ptr[Byte]],
-          decValuesCount.toUSize * sizeof[CDouble],
+        // Single function call - all complexity handled in C++
+        val predictedLabel = LibSVM.svm_predict_with_scores(
+          svmModel,
+          inputPtr,
+          numFeatures,
+          scoresPtr,
         )
+
+        // Write back the predicted label
+        !labelPtr = predictedLabel
+
         ()
       }
     }
   }
 
-  /** A resource-safe helper for `stdlib.malloc`. Throws `OutOfMemoryError` on allocation failure.
+  /** Creates an SVM model using the C++ wrapper functions with proper resource management. All
+    * memory allocation and model construction is handled in C for maximum reliability.
     */
-  private def malloc[T](size: CSize): Resource[IO, Ptr[T]] =
-    Resource
-      .make(IO {
-        val p = stdlib.malloc(size)
-        if (p == null) throw new OutOfMemoryError(s"Failed to allocate $size bytes")
-        p
-      })(ptr => IO(stdlib.free(ptr)))
-      .map(_.asInstanceOf[Ptr[T]])
-
-  /** Constructs a native `svm_model` struct from the model's IR definition. All native memory
-    * required for the struct (for params, coefficients, vectors, etc.) is allocated and managed
-    * within a single `Resource` scope to ensure it is all safely deallocated after use.
-    */
-  private def buildSvmModelResource(
+  private def createSvmModelResource(
       op: Operation.SVMClassifier,
       numFeatures: Int,
-  ): Resource[IO, Ptr[svm_model]] = {
+  ): Resource[IO, Ptr[Byte]] = {
     val nrClass = op.classLabels.size
     val numSupportVectors = op.vectorsPerClass.sum.toInt
 
-    // A single resource that acquires all necessary native memory for the SVM model struct.
-    val allAllocs = (
-      malloc[svm_model](sizeof[svm_model]),
-      malloc[svm_parameter](sizeof[svm_parameter]),
-      malloc[CInt](sizeof[CInt] * nrClass.toUSize),
-      malloc[CDouble](sizeof[CDouble] * op.rho.size.toUSize),
-      malloc[CInt](sizeof[CInt] * nrClass.toUSize),
-      malloc[Ptr[svm_node]](sizeof[Ptr[svm_node]] * numSupportVectors.toUSize),
-      malloc[Ptr[CDouble]](sizeof[Ptr[CDouble]] * (nrClass - 1).toUSize),
-      (0 until numSupportVectors).toList
-        .traverse(_ => malloc[svm_node](sizeof[svm_node] * (numFeatures + 1).toUSize)),
-      (0 until nrClass - 1).toList
-        .traverse(_ => malloc[CDouble](sizeof[CDouble] * numSupportVectors.toUSize)),
-    ).tupled
+    for {
+      // Create SVM parameter using C++ wrapper
+      param <- createSvmParameterResource(op)
 
-    allAllocs.map { case (model, param, label, rho, nSV, svs, svCoefs, svRows, coefRows) =>
-      // Populate svm_parameter
-      param.svm_type = 0 // SVM_TYPE_C_SVC
-      param.kernel_type = op.kernelType match {
-        case SVMKernel.Linear => LINEAR
-        case SVMKernel.Poly => POLY
-        case SVMKernel.Rbf => RBF
-        case SVMKernel.Sigmoid => SIGMOID
-      }
-      param.gamma = op.kernelParams.headOption.getOrElse(0.0)
-      param.coef0 = op.kernelParams.drop(1).headOption.getOrElse(0.0)
-      param.degree = op.kernelParams.drop(2).headOption.map(_.toInt).getOrElse(3)
+      // Create managed arrays for model data
+      supportVectorsPtr <- createManagedDoubleArray(op.supportVectors)
+      coefficientsPtr <- createManagedDoubleArray(op.coefficients)
+      rhoPtr <- createManagedDoubleArray(op.rho.toArray)
+      classLabelsPtr <- createManagedIntArray(op.classLabels.map(_.toInt).toArray)
+      vectorsPerClassPtr <- createManagedIntArray(op.vectorsPerClass.map(_.toInt).toArray)
 
-      // Populate arrays with model data
-      var i = 0
-      while (i < op.classLabels.length) { !(label + i) = op.classLabels(i).toInt; i += 1 }
-      i = 0
-      while (i < op.rho.length) { !(rho + i) = op.rho(i); i += 1 }
-      i = 0
-      while (i < op.vectorsPerClass.length) { !(nSV + i) = op.vectorsPerClass(i).toInt; i += 1 }
+      // Create the SVM model using C++ wrapper with LibSVM's native cleanup
+      svmModel <- Resource.make(IO {
+        LibSVM.create_svm_model(
+          param,
+          nrClass,
+          numSupportVectors,
+          supportVectorsPtr,
+          numFeatures,
+          coefficientsPtr,
+          rhoPtr,
+          classLabelsPtr,
+          vectorsPerClassPtr,
+        )
+      })(model =>
+        IO {
+          // Use LibSVM's native cleanup function
+          val modelPtrPtr = stdlib.malloc(sizeof[Ptr[Byte]]).asInstanceOf[Ptr[Ptr[Byte]]]
+          !modelPtrPtr = model
+          LibSVM.svm_free_and_destroy_model(modelPtrPtr)
+          stdlib.free(modelPtrPtr.asInstanceOf[Ptr[Byte]])
+        },
+      )
 
-      // Populate the support vector nodes
-      i = 0
-      while (i < svRows.length) {
-        val svRowPtr = svRows(i)
-        !(svs + i) = svRowPtr
-        var j = 0
-        while (j < numFeatures) {
-          val node = svRowPtr + j
-          node.index = j + 1
-          node.value = op.supportVectors(i * numFeatures + j)
-          j += 1
-        }
-        (svRowPtr + numFeatures).index = -1 // Terminator node
-        i += 1
-      }
-
-      // Populate the support vector coefficients
-      i = 0
-      while (i < coefRows.length) {
-        val coefRowPtr = coefRows(i)
-        !(svCoefs + i) = coefRowPtr
-        var j = 0
-        while (j < numSupportVectors) {
-          val index = i * numSupportVectors + j
-          !(coefRowPtr + j) = op.coefficients(index)
-          j += 1
-        }
-        i += 1
-      }
-
-      // Link all the populated memory to the main svm_model struct
-      model.param = param
-      model.nr_class = nrClass
-      model.l = numSupportVectors
-      model.label = label
-      model.rho = rho
-      model.nSV = nSV
-      model.SV = svs
-      model.sv_coef = svCoefs
-      model
-    }
+    } yield svmModel
   }
+
+  /** Creates SVM parameter using C++ wrapper with proper resource management. */
+  private def createSvmParameterResource(op: Operation.SVMClassifier): Resource[IO, Ptr[Byte]] = {
+    val kernelType = op.kernelType match {
+      case SVMKernel.Linear => 0
+      case SVMKernel.Poly => 1
+      case SVMKernel.Rbf => 2
+      case SVMKernel.Sigmoid => 3
+    }
+
+    val gamma = op.kernelParams.headOption.getOrElse(0.0)
+    val coef0 = op.kernelParams.drop(1).headOption.getOrElse(0.0)
+    val degree = op.kernelParams.drop(2).headOption.map(_.toInt).getOrElse(3)
+
+    Resource.make(IO {
+      LibSVM.create_svm_param(
+        svm_type = 0, // C_SVC
+        kernel_type = kernelType,
+        degree = degree,
+        gamma = gamma,
+        coef0 = coef0,
+      )
+    })(param => IO(stdlib.free(param)))
+  }
+
+  /** Helper to create managed double array for C++ wrapper calls. */
+  private def createManagedDoubleArray(values: Array[Double]): Resource[IO, Ptr[CDouble]] =
+    Resource.make(IO {
+      val ptr = stdlib
+        .malloc(sizeof[CDouble] * values.length.toUSize)
+        .asInstanceOf[Ptr[CDouble]]
+      if (ptr == null) throw new OutOfMemoryError(s"Failed to allocate ${values.length} doubles")
+
+      for (i <- values.indices)
+        ptr(i) = values(i)
+      ptr
+    })(ptr => IO(stdlib.free(ptr.asInstanceOf[Ptr[Byte]])))
+
+  /** Helper to create managed int array for C++ wrapper calls. */
+  private def createManagedIntArray(values: Array[Int]): Resource[IO, Ptr[CInt]] =
+    Resource.make(IO {
+      val ptr = stdlib
+        .malloc(sizeof[CInt] * values.length.toUSize)
+        .asInstanceOf[Ptr[CInt]]
+      if (ptr == null) throw new OutOfMemoryError(s"Failed to allocate ${values.length} ints")
+
+      for (i <- values.indices)
+        ptr(i) = values(i)
+      ptr
+    })(ptr => IO(stdlib.free(ptr.asInstanceOf[Ptr[Byte]])))
 
   /** Creates empty Scala arrays for each graph output. These arrays will be pointed to by the
     * `memoryResource` and written to directly from native code.
