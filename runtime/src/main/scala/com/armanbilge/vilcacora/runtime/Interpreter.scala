@@ -19,7 +19,7 @@ package com.armanbilge.vilcacora.runtime
 import cats.effect.{IO, Resource}
 import cats.syntax.all._
 import com.armanbilge.vilcacora.ir._
-import com.armanbilge.vilcacora.runtime.LibSVM
+import com.armanbilge.vilcacora.runtime.LibSVM._
 import scala.scalanative.unsafe._
 import scala.scalanative.libc.stdlib
 import scala.scalanative.libc.string.memcpy
@@ -326,7 +326,7 @@ object Interpreter {
         val labelPtr = memory(op.outputLabel).asInstanceOf[Ptr[CInt]]
 
         // Single function call - all complexity handled in C++
-        val predictedLabel = LibSVM.svm_predict_with_scores(
+        val predictedLabel = svm_predict_with_scores(
           svmModel,
           inputPtr,
           numFeatures,
@@ -364,7 +364,7 @@ object Interpreter {
 
       // Create the SVM model using C++ wrapper with LibSVM's native cleanup
       svmModel <- Resource.make(IO {
-        LibSVM.create_svm_model(
+        create_svm_model(
           param,
           nrClass,
           numSupportVectors,
@@ -380,7 +380,7 @@ object Interpreter {
           // Use LibSVM's native cleanup function
           val modelPtrPtr = stdlib.malloc(sizeof[Ptr[Byte]]).asInstanceOf[Ptr[Ptr[Byte]]]
           !modelPtrPtr = model
-          LibSVM.svm_free_and_destroy_model(modelPtrPtr)
+          svm_free_and_destroy_model(modelPtrPtr)
           stdlib.free(modelPtrPtr.asInstanceOf[Ptr[Byte]])
         },
       )
@@ -402,7 +402,7 @@ object Interpreter {
     val degree = op.kernelParams.drop(2).headOption.map(_.toInt).getOrElse(3)
 
     Resource.make(IO {
-      LibSVM.create_svm_param(
+      create_svm_param(
         svm_type = 0, // C_SVC
         kernel_type = kernelType,
         degree = degree,
