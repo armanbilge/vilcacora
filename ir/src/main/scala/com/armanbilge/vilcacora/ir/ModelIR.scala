@@ -174,15 +174,14 @@ object Operation {
     override def outputs: List[String] = List(output)
   }
 
-  /** Represents a Constant operation that produces a constant tensor. Uses Array for value since
-    * tensor data can be large and needs efficient access.
+  /** Represents a Constant operation that produces a constant tensor.
     */
   final case class Constant(
       output: String,
       // --- Attributes ---
-      value: Array[Byte], // Raw tensor data - Array for large data and direct access
+      value: Array[Byte],
       dataType: DataType,
-      shape: List[Int], // List since tensor shapes are typically small
+      shape: List[Int],
   ) extends Operation {
     override def inputs: List[String] = List.empty
     override def outputs: List[String] = List(output)
@@ -195,8 +194,7 @@ object Operation {
     override def outputs: List[String] = List(output)
   }
 
-  /** Represents a Convolution operation. Uses List for small attribute sequences like strides,
-    * pads, etc.
+  /** Represents a Convolution operation.
     */
   final case class Conv(
       input: String,
@@ -205,11 +203,11 @@ object Operation {
       output: String,
       // --- Attributes ---
       autoPad: AutoPad = AutoPad.NotSet,
-      dilations: List[Int] = List.empty, // List - typically small sequences
+      dilations: List[Int] = List.empty,
       group: Int = 1,
-      kernelShape: List[Int] = List.empty, // List - small sequences
-      pads: List[Int] = List.empty, // List - small sequences
-      strides: List[Int] = List.empty, // List - small sequences
+      kernelShape: List[Int] = List.empty,
+      pads: List[Int] = List.empty,
+      strides: List[Int] = List.empty,
   ) extends Operation {
     override def inputs: List[String] = List(input, weight) ++ bias.toList
     override def outputs: List[String] = List(output)
@@ -222,8 +220,7 @@ object Operation {
     override def outputs: List[String] = List(output)
   }
 
-  /** Represents a MaxPool operation. Uses List for attribute sequences since they are typically
-    * small.
+  /** Represents a MaxPool operation.
     */
   final case class MaxPool(
       input: String,
@@ -232,7 +229,7 @@ object Operation {
       autoPad: AutoPad = AutoPad.NotSet,
       ceilMode: Boolean = false,
       dilations: List[Int] = List.empty,
-      kernelShape: List[Int], // Required attribute - List for small sequences
+      kernelShape: List[Int],
       pads: List[Int] = List.empty,
       storageOrder: Int = 0,
       strides: List[Int] = List.empty,
