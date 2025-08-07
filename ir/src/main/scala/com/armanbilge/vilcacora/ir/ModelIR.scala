@@ -85,6 +85,24 @@ object PostTransform {
   }
 }
 
+/** Representation of auto_pad attribute for Conv and Pool operations.
+  */
+sealed abstract class AutoPad
+object AutoPad {
+  case object NotSet extends AutoPad
+  case object SameUpper extends AutoPad
+  case object SameLower extends AutoPad
+  case object Valid extends AutoPad
+
+  def fromString(s: String): Either[String, AutoPad] = s.toUpperCase match {
+    case "NOTSET" => Right(NotSet)
+    case "SAME_UPPER" => Right(SameUpper)
+    case "SAME_LOWER" => Right(SameLower)
+    case "VALID" => Right(Valid)
+    case other => Left(s"Unsupported AutoPad: $other")
+  }
+}
+
 /** An ADT representing a single operation in the computation graph.
   */
 sealed abstract class Operation {
@@ -153,6 +171,86 @@ object Operation {
       supportVectors: Array[Double],
   ) extends Operation {
     override def inputs: List[String] = List(input)
+    override def outputs: List[String] = List(output)
+  }
+
+  /** Represents a Constant operation that produces a constant tensor. Uses Array for value since
+    * tensor data can be large and needs efficient access.
+    */
+  final case class Constant(
+      output: String,
+      // --- Attributes ---
+      value: Array[Byte], // Raw tensor data - Array for large data and direct access
+      dataType: DataType,
+      shape: List[Int], // List since tensor shapes are typically small
+  ) extends Operation {
+    override def inputs: List[String] = List.empty
+    override def outputs: List[String] = List(output)
+  }
+
+  /** Represents an element-wise division operation.
+    */
+  final case class Div(inputA: String, inputB: String, output: String) extends Operation {
+    override def inputs: List[String] = List(inputA, inputB)
+    override def outputs: List[String] = List(output)
+  }
+
+  /** Represents a Convolution operation. Uses List for small attribute sequences like strides,
+    * pads, etc.
+    */
+  final case class Conv(
+      input: String,
+      weight: String,
+      bias: Option[String],
+      output: String,
+      // --- Attributes ---
+      autoPad: AutoPad = AutoPad.NotSet,
+      dilations: List[Int] = List.empty, // List - typically small sequences
+      group: Int = 1,
+      kernelShape: List[Int] = List.empty, // List - small sequences
+      pads: List[Int] = List.empty, // List - small sequences
+      strides: List[Int] = List.empty, // List - small sequences
+  ) extends Operation {
+    override def inputs: List[String] = List(input, weight) ++ bias.toList
+    override def outputs: List[String] = List(output)
+  }
+
+  /** Represents a ReLU (Rectified Linear Unit) activation operation.
+    */
+  final case class Relu(input: String, output: String) extends Operation {
+    override def inputs: List[String] = List(input)
+    override def outputs: List[String] = List(output)
+  }
+
+  /** Represents a MaxPool operation. Uses List for attribute sequences since they are typically
+    * small.
+    */
+  final case class MaxPool(
+      input: String,
+      output: String,
+      // --- Attributes ---
+      autoPad: AutoPad = AutoPad.NotSet,
+      ceilMode: Boolean = false,
+      dilations: List[Int] = List.empty,
+      kernelShape: List[Int], // Required attribute - List for small sequences
+      pads: List[Int] = List.empty,
+      storageOrder: Int = 0,
+      strides: List[Int] = List.empty,
+  ) extends Operation {
+    override def inputs: List[String] = List(input)
+    override def outputs: List[String] = List(output)
+  }
+
+  /** Represents a Reshape operation. Takes a shape tensor as input following ONNX specification.
+    */
+  final case class Reshape(
+      input: String,
+      shape: String, // Shape tensor input name
+      output: String,
+      // --- Attributes ---
+      allowzero: Boolean = false,
+  ) extends Operation {
+    override def inputs: List[String] = List(input, shape)
     override def outputs: List[String] = List(output)
   }
   // Add more operations here...

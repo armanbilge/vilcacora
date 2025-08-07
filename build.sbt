@@ -19,7 +19,7 @@ ThisBuild / githubWorkflowBuildPreamble ++= nativeBrewInstallWorkflowSteps.value
 
 ThisBuild / Test / testOptions += Tests.Argument("+l") // for munit logging
 
-val CatsEffectVersion = "3.7-8f2b497"
+val CatsEffectVersion = "3.7.0-RC1"
 val CatsVersion = "2.12.0"
 val MunitVersion = "1.0.4"
 lazy val root = tlCrossRootProject.aggregate(ir, onnx, runtime)
