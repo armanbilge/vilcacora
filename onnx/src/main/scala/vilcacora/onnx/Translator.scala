@@ -164,7 +164,7 @@ object Translator {
     val attributes = new OnnxAttributeHelper(node)
     node.opType match {
       // Group simple binary operators
-      case "MatMul" | "Add" | "Mul" =>
+      case "MatMul" | "Add" | "Mul" | "Div" =>
         for {
           // The arity check ensures the .head and (1) accessors below are safe.
           _ <- checkArity(node, expectedInputs = 2, expectedOutputs = 1)
@@ -173,6 +173,7 @@ object Translator {
               Right(Operation.MatMul(node.input.head, node.input(1), node.output.head))
             case "Add" => Right(Operation.Add(node.input.head, node.input(1), node.output.head))
             case "Mul" => Right(Operation.Mul(node.input.head, node.input(1), node.output.head))
+            case "Div" => Right(Operation.Div(node.input.head, node.input(1), node.output.head))
             case _ => Left("Internal error: Unreachable code in operator matching")
           }
         } yield op
@@ -210,6 +211,148 @@ object Translator {
           supportVectors = supportVectors.map(_.toDouble).toArray,
           vectorsPerClass = vectorsPerClass.toList,
         )
+
+      // Represents a ReLU (Rectified Linear Unit) activation operation.
+      case "Relu" =>
+        for {
+          _ <- checkArity(node, expectedInputs = 1, expectedOutputs = 1)
+        } yield Operation.Relu(node.input.head, node.output.head)
+
+      // Represents a Reshape operation.
+      case "Reshape" =>
+        for {
+          _ <- checkArity(node, expectedInputs = 2, expectedOutputs = 1)
+          // The 'allowzero' attribute is optional and defaults to 0 (false).
+          allowzero = node.attribute.find(_.name == "allowzero").map(_.i).getOrElse(0L) != 0L
+        } yield Operation.Reshape(
+          input = node.input.head,
+          shape = node.input(1),
+          output = node.output.head,
+          allowzero = allowzero,
+        )
+
+      // Represents a Convolution operation.
+      case "Conv" =>
+        for {
+          _ <-
+            if ((node.input.size == 2 || node.input.size == 3) && node.output.size == 1)
+              Right(())
+            else
+              Left(
+                s"Node '${node.name}' (opType: Conv) expects 2 or 3 inputs and 1 output, but got ${node.input.size} and ${node.output.size}",
+              )
+
+          // 'kernel_shape' is a required attribute.
+          kernelShape <- attributes.getInts("kernel_shape")
+
+          // Handle optional attributes with defaults as per ONNX specification.
+          autoPadStr = node.attribute
+            .find(_.name == "auto_pad")
+            .map(_.s.toStringUtf8())
+            .getOrElse("NOTSET")
+          autoPad <- AutoPad.fromString(autoPadStr)
+          group = node.attribute.find(_.name == "group").map(_.i).getOrElse(1L)
+
+          spatialDims = kernelShape.size
+          dilations = node.attribute
+            .find(_.name == "dilations")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims)(1L))
+          pads = node.attribute
+            .find(_.name == "pads")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims * 2)(0L))
+          strides = node.attribute
+            .find(_.name == "strides")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims)(1L))
+
+        } yield Operation.Conv(
+          input = node.input.head,
+          weight = node.input(1),
+          bias = if (node.input.size == 3) Some(node.input(2)) else None,
+          output = node.output.head,
+          autoPad = autoPad,
+          dilations = dilations.map(_.toInt).toList,
+          group = group.toInt,
+          kernelShape = kernelShape.map(_.toInt).toList,
+          pads = pads.map(_.toInt).toList,
+          strides = strides.map(_.toInt).toList,
+        )
+
+      // Represents a MaxPool operation.
+      case "MaxPool" =>
+        for {
+          // The IR only uses the first output, but ONNX can have a second (indices).
+          _ <-
+            if (node.input.size == 1 && node.output.nonEmpty) Right(())
+            else
+              Left(
+                s"Node '${node.name}' (opType: MaxPool) expects 1 input and at least 1 output, but got ${node.input.size} and ${node.output.size}",
+              )
+
+          // 'kernel_shape' is a required attribute.
+          kernelShape <- attributes.getInts("kernel_shape")
+
+          // Handle optional attributes with defaults.
+          autoPadStr = node.attribute
+            .find(_.name == "auto_pad")
+            .map(_.s.toStringUtf8())
+            .getOrElse("NOTSET")
+          autoPad <- AutoPad.fromString(autoPadStr)
+          ceilMode = node.attribute.find(_.name == "ceil_mode").map(_.i).getOrElse(0L) != 0L
+          storageOrder = node.attribute.find(_.name == "storage_order").map(_.i).getOrElse(0L)
+
+          spatialDims = kernelShape.size
+          dilations = node.attribute
+            .find(_.name == "dilations")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims)(1L))
+          pads = node.attribute
+            .find(_.name == "pads")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims * 2)(0L))
+          strides = node.attribute
+            .find(_.name == "strides")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims)(1L))
+
+        } yield Operation.MaxPool(
+          input = node.input.head,
+          output = node.output.head,
+          autoPad = autoPad,
+          ceilMode = ceilMode,
+          dilations = dilations.map(_.toInt).toList,
+          kernelShape = kernelShape.map(_.toInt).toList,
+          pads = pads.map(_.toInt).toList,
+          storageOrder = storageOrder.toInt,
+          strides = strides.map(_.toInt).toList,
+        )
+      case "Constant" =>
+        for {
+          // A Constant node has 0 inputs and 1 output.
+          _ <- checkArity(node, expectedInputs = 0, expectedOutputs = 1)
+
+          // The constant's data is stored in a 'value' attribute of type TensorProto.
+          valueAttribute <- node.attribute
+            .find(_.name == "value")
+            .toRight(s"Constant node '${node.name}' is missing the 'value' attribute.")
+
+          tensorProto <- valueAttribute.t
+            .toRight(s"Attribute 'value' in Constant node '${node.name}' is not a tensor.")
+
+          // Use existing helpers to extract the data type and raw bytes.
+          dataType <- fromOnnxDataType(tensorProto.dataType)
+          shape = tensorProto.dims.map(_.toInt).toList
+          data <- extractBytes(tensorProto, dataType)
+
+        } yield Operation.Constant(
+          output = node.output.head,
+          value = data,
+          dataType = dataType,
+          shape = shape,
+        )
+
       case unsupported => Left(s"Unsupported operation type: $unsupported")
     }
   }
@@ -352,5 +495,6 @@ object Translator {
         .get(name)
         .toRight(s"Missing attribute '$name' in node '${node.name}'")
         .map(_.ints)
+
   }
 }

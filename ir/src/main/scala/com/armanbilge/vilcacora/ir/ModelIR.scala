@@ -202,12 +202,12 @@ object Operation {
       bias: Option[String],
       output: String,
       // --- Attributes ---
-      autoPad: AutoPad = AutoPad.NotSet,
-      dilations: List[Int] = List.empty,
-      group: Int = 1,
-      kernelShape: List[Int] = List.empty,
-      pads: List[Int] = List.empty,
-      strides: List[Int] = List.empty,
+      autoPad: AutoPad,
+      dilations: List[Int],
+      group: Int,
+      kernelShape: List[Int],
+      pads: List[Int],
+      strides: List[Int],
   ) extends Operation {
     override def inputs: List[String] = List(input, weight) ++ bias.toList
     override def outputs: List[String] = List(output)
@@ -226,13 +226,13 @@ object Operation {
       input: String,
       output: String,
       // --- Attributes ---
-      autoPad: AutoPad = AutoPad.NotSet,
-      ceilMode: Boolean = false,
-      dilations: List[Int] = List.empty,
+      autoPad: AutoPad,
+      ceilMode: Boolean,
+      dilations: List[Int],
       kernelShape: List[Int],
-      pads: List[Int] = List.empty,
-      storageOrder: Int = 0,
-      strides: List[Int] = List.empty,
+      pads: List[Int],
+      storageOrder: Int,
+      strides: List[Int],
   ) extends Operation {
     override def inputs: List[String] = List(input)
     override def outputs: List[String] = List(output)

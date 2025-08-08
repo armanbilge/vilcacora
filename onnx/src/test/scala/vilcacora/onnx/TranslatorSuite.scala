@@ -16,11 +16,12 @@
 
 package vilcacora.onnx
 
-import com.armanbilge.vilcacora.ir.{DataType, Operation, PostTransform, SVMKernel}
-import vilcacora.onnx.proto.{AttributeProto, ModelProto, NodeProto}
+import com.armanbilge.vilcacora.ir.{DataType, Operation, PostTransform, SVMKernel, AutoPad}
+import vilcacora.onnx.proto.{AttributeProto, ModelProto, NodeProto, TensorProto}
 import com.google.protobuf.ByteString
 import munit.FunSuite
 import java.io.InputStream
+import java.nio.{ByteBuffer, ByteOrder}
 
 class TranslatorSuite extends FunSuite {
 
@@ -94,6 +95,128 @@ class TranslatorSuite extends FunSuite {
         }
       case other => fail(s"Expected SVMClassifier but got $other")
     }
+  }
+  test("translateNode should translate a Div node") {
+    val node =
+      NodeProto(opType = "Div", input = Seq("Numerator", "Denominator"), output = Seq("Quotient"))
+    assertEquals(
+      Translator.translateNode(node),
+      Right(Operation.Div("Numerator", "Denominator", "Quotient")),
+    )
+  }
+
+  test("translateNode should translate a Relu node") {
+    val node = NodeProto(opType = "Relu", input = Seq("X"), output = Seq("Y"))
+    assertEquals(Translator.translateNode(node), Right(Operation.Relu("X", "Y")))
+  }
+
+  test("translateNode should translate a Reshape node") {
+    val node = NodeProto(opType = "Reshape", input = Seq("data", "shape"), output = Seq("reshaped"))
+    // Test with the default 'allowzero' attribute
+    assertEquals(
+      Translator.translateNode(node),
+      Right(Operation.Reshape("data", "shape", "reshaped", allowzero = false)),
+    )
+  }
+
+  test("translateNode should translate a Constant node") {
+    // Prepare the raw byte data for a Float32 tensor with value [1.0f, 2.0f]
+    val byteBuffer = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
+    byteBuffer.putFloat(1.0f)
+    byteBuffer.putFloat(2.0f)
+    val rawBytes = byteBuffer.array()
+
+    // The constant data is stored as a TensorProto inside an AttributeProto
+    val tensorProto = TensorProto(
+      dataType = 1, // Float32
+      dims = Seq(2),
+      rawData = ByteString.copyFrom(rawBytes),
+    )
+    val attribute = AttributeProto(
+      name = "value",
+      t = Some(tensorProto),
+      `type` = AttributeProto.AttributeType.TENSOR,
+    )
+
+    val node = NodeProto(
+      opType = "Constant",
+      input = Nil,
+      output = Seq("const_out"),
+      attribute = Seq(attribute),
+    )
+
+    val result = Translator.translateNode(node)
+    assert(result.isRight, "Constant translation failed")
+    result.foreach {
+      case op: Operation.Constant =>
+        assertEquals(op.output, "const_out")
+        assertEquals(op.dataType, DataType.Float32)
+        assertEquals(op.shape, List(2))
+        assert(op.value.sameElements(rawBytes), "Raw byte data did not match")
+      case other => fail(s"Expected Constant but got $other")
+    }
+  }
+
+  test("translateNode should translate a Conv node") {
+    val node = NodeProto(
+      opType = "Conv",
+      input = Seq("X", "W", "B"), // Input, Weights, Bias
+      output = Seq("Y"),
+      attribute = Seq(
+        AttributeProto(name = "kernel_shape", ints = Seq(3L, 3L)),
+        AttributeProto(name = "strides", ints = Seq(1L, 1L)),
+        AttributeProto(name = "pads", ints = Seq(1L, 1L, 1L, 1L)),
+        AttributeProto(name = "dilations", ints = Seq(1L, 1L)),
+        AttributeProto(name = "group", i = 1L),
+        AttributeProto(name = "auto_pad", s = ByteString.copyFromUtf8("NOTSET")),
+      ),
+    )
+
+    val expected = Operation.Conv(
+      input = "X",
+      weight = "W",
+      bias = Some("B"),
+      output = "Y",
+      autoPad = AutoPad.NotSet,
+      dilations = List(1, 1),
+      group = 1,
+      kernelShape = List(3, 3),
+      pads = List(1, 1, 1, 1),
+      strides = List(1, 1),
+    )
+
+    assertEquals(Translator.translateNode(node), Right(expected))
+  }
+
+  test("translateNode should translate a MaxPool node") {
+    val node = NodeProto(
+      opType = "MaxPool",
+      input = Seq("X"),
+      output = Seq("Y"),
+      attribute = Seq(
+        AttributeProto(name = "kernel_shape", ints = Seq(2L, 2L)),
+        AttributeProto(name = "strides", ints = Seq(2L, 2L)),
+        AttributeProto(name = "pads", ints = Seq(0L, 0L, 0L, 0L)),
+        AttributeProto(name = "ceil_mode", i = 0L),
+        AttributeProto(name = "storage_order", i = 0L),
+        AttributeProto(name = "dilations", ints = Seq(1L, 1L)),
+        AttributeProto(name = "auto_pad", s = ByteString.copyFromUtf8("NOTSET")),
+      ),
+    )
+
+    val expected = Operation.MaxPool(
+      input = "X",
+      output = "Y",
+      autoPad = AutoPad.NotSet,
+      ceilMode = false,
+      dilations = List(1, 1),
+      kernelShape = List(2, 2),
+      pads = List(0, 0, 0, 0),
+      storageOrder = 0,
+      strides = List(2, 2),
+    )
+
+    assertEquals(Translator.translateNode(node), Right(expected))
   }
 
   // --- End-to-end tests using model files from resources ---
