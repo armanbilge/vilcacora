@@ -136,8 +136,6 @@ object MainApp extends IOApp.Simple {
           }.flatMap { inputImage =>
             val inputData: Map[String, Array[Float]] = Map(inputTensorName -> inputImage)
 
-            IO.println("--- Running MNIST Inference ---") >>
-
             // 3. Execute the model via the interpreter
             Interpreter.execute(modelIR, inputData).use { ioResult =>
               ioResult.flatMap { outputMap =>
