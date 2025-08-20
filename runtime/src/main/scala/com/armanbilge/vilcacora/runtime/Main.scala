@@ -51,30 +51,7 @@ object MainApp extends IOApp.Simple {
     image
   }
 
-  // Create a checkerboard pattern for testing
-  private def createCheckerboardInput(): Array[Float] = {
-    val image = Array.ofDim[Float](1 * 1 * 28 * 28)
-
-    for {
-      h <- 0 until 28
-      w <- 0 until 28
-    } {
-      val idx = h * 28 + w
-      // Create a simple checkerboard pattern
-      image(idx) = if ((h / 4 + w / 4) % 2 == 0) 1.0f else 0.0f
-    }
-
-    image
-  }
-
-  // Load an actual image file if available (optional)
-  private def loadImageFromFile(imagePath: String): IO[Array[Float]] = IO {
-    // This would require additional image processing libraries
-    // For now, just return a synthetic pattern
-    println(s"Note: Image loading from file not implemented, using synthetic data")
-    createMNISTInput()
-  }
-
+ 
   private def printImagePreview(image: Array[Float], width: Int = 28, height: Int = 28): Unit = {
     println("Input image preview (28x28):")
     for (h <- 0 until height) {
