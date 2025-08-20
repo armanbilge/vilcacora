@@ -65,7 +65,7 @@ lazy val onnx = project
 
 lazy val runtime = project
   .enablePlugins(ScalaNativePlugin, ScalaNativeBrewedConfigPlugin)
-  .dependsOn(ir)
+  .dependsOn(ir, onnx)
   .settings(
     name := "vilcacora-runtime",
     libraryDependencies ++= Seq(
@@ -74,4 +74,9 @@ lazy val runtime = project
       "org.scalameta" %%% "munit" % MunitVersion % Test,
     ),
     nativeBrewFormulas ++= Set("openblas", "mlpack", "libsvm"),
+    nativeConfig ~= { c =>
+      c.withCompileOptions(
+        c.compileOptions ++ Seq("-fexceptions", "-frtti", "-Wno-inconsistent-missing-override"),
+      )
+    },
   )

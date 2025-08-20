@@ -1,0 +1,3213 @@
+runtime/src/main/scala/com/armanbilge/vilcacora/runtime/Interpreter.scala
+/*
+
+Copyright 2023 Arman Bilge
+
+Licensed under the Apache License, Version 2.0 (the "License");
+
+you may not use this file except in compliance with the License.
+
+You may obtain a copy of the License at
+
+code
+Code
+download
+content_copy
+expand_less
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+
+distributed under the License is distributed on an "AS IS" BASIS,
+
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+See the License for the specific language governing permissions and
+
+limitations under the License.
+*/
+
+package com.armanbilge.vilcacora.runtime
+
+import cats.effect.{IO, Resource}
+import cats.syntax.all._
+import com.armanbilge.vilcacora.ir._
+import com.armanbilge.vilcacora.runtime.LibSVM._
+import scala.scalanative.unsafe._
+import scala.scalanative.libc.stdlib
+import scala.scalanative.libc.string.memcpy
+import scala.scalanative.unsigned._
+import scala.collection.mutable.ListBuffer
+import com.armanbilge.vilcacora.runtime.TinyCNN._
+import com.armanbilge.vilcacora.runtime.BLAS._
+import com.armanbilge.vilcacora.runtime.BLASConstants._
+
+/** The core execution engine for a translated ModelIR. It manages native memory and executes
+
+model operations within a Cats Effect IO context.
+*/
+object Interpreter {
+
+/** A type alias mapping a tensor's name to its pointer in native memory. */
+type MemoryMap = Map[String, Ptr[Byte]]
+
+/** Executes a complete ModelIR graph.
+*
+* The process is separated into two stages:
+*   1. A synchronous validation of the model to fail-fast on unsupported operations. 2. An
+*      asynchronous, resource-safe execution of the graph operations within an IO context.
+*
+* @param model
+*   The intermediate representation of the model to execute.
+* @param inputs
+*   A map of input tensor names to their corresponding Scala arrays.
+* @return
+*   An IO containing a map of output tensor names to their resulting Scala arrays.
+*/
+def execute(
+model: ModelIR,
+inputs: Map[String, Array[]],
+): Resource[IO, IO[Map[String, Array[]]]] = {
+validateModel(model)
+val outputArrays: Map[String, Array[_]] = createOutputArrays(model)
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+memoryResource(model, inputs, outputArrays).flatMap { memoryMap =>
+  val opResources: List[Resource[IO, IO[Unit]]] =
+    model.operations.map(op => executeOperation(op, memoryMap, model))
+
+  val combined: Resource[IO, List[IO[Unit]]] = opResources.sequence
+
+  combined.map { opIOs =>
+    val runOps: IO[Unit] = opIOs.traverse_(_ *> IO.cede)
+    runOps.as(outputArrays)
+  }
+}
+
+}
+
+/** Synchronously validates the model definition, throwing a NotImplementedError if any
+* operation or data type cast is not supported. This ensures the interpreter fails before any
+* memory is allocated or side effects are scheduled.
+*/
+private def validateModel(model: ModelIR): Unit =
+model.operations.foreach {
+case _: Operation.SVMClassifier | : Operation.Mul |: Operation.Conv | _: Operation.MaxPool  =>
+() // Supported
+case op: Operation.Add =>
+// Validate Add operation broadcasting compatibility
+val shapeA = model.allocations(op.inputs(0)).shape
+val shapeB = model.allocations(op.inputs(1)).shape
+val outputShape = model.allocations(op.outputs.head).shape
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+// Validate data type compatibility
+    val inputAAlloc = model.allocations(op.inputs(0))
+    val inputBAlloc = model.allocations(op.inputs(1))
+    val outputAlloc = model.allocations(op.outputs.head)
+    
+    require(
+      inputAAlloc.dataType == inputBAlloc.dataType &&
+      inputBAlloc.dataType == outputAlloc.dataType,
+      s"Add operation requires all tensors to have the same data type. " +
+      s"Got: ${inputAAlloc.dataType}, ${inputBAlloc.dataType}, ${outputAlloc.dataType}"
+    )
+    
+    // Validate broadcasting compatibility
+    val broadcastedShape = calculateBroadcastShape(shapeA, shapeB)
+    require(
+      broadcastedShape.isDefined && broadcastedShape.get == outputShape,
+      s"Add operation broadcasting incompatible: shapes ${shapeA.mkString("x")} and ${shapeB.mkString("x")} " +
+      s"cannot broadcast to output shape ${outputShape.mkString("x")}. " +
+      s"Expected output shape: ${broadcastedShape.map(_.mkString("x")).getOrElse("incompatible")}"
+    )
+  case op: Operation.Cast =>
+    val from = model.allocations(op.input).dataType
+    val to = model.allocations(op.output).dataType
+    (from, to) match {
+      case (f, t) if f == t => ()
+      case (DataType.Float64, DataType.Float32) => ()
+      case (DataType.Float32, DataType.Float64) => ()
+      case (from, to) =>
+        throw new NotImplementedError(s"Cast from $from to $to is not implemented.")
+    }
+  case op: Operation.Relu =>
+  // Validate ReLU operation requirements
+  val inputAlloc = model.allocations(op.input)
+  inputAlloc.dataType match {
+    case DataType.Float32 | DataType.Float64 => () // Supported
+    case unsupported =>
+      throw new NotImplementedError(s"ReLU operation not implemented for data type: $unsupported")
+  }
+  case op: Operation.Reshape =>
+  // Validate reshape operation requirements
+  val inputAlloc = model.allocations(op.input)
+  val outputAlloc = model.allocations(op.output)
+  require(
+    inputAlloc.shape.product == outputAlloc.shape.product,
+    s"Reshape operation '${op.input} -> ${op.output}' requires same total elements. " +
+    s"Input shape ${inputAlloc.shape} has ${inputAlloc.shape.product} elements, " +
+    s"output shape ${outputAlloc.shape} has ${outputAlloc.shape.product} elements"
+  ) 
+
+  case op: Operation.MatMul =>
+  // Validate MatMul operation requirements
+  val inputAAlloc = model.allocations(op.inputA)
+  val inputBAlloc = model.allocations(op.inputB) 
+  val outputAlloc = model.allocations(op.output)
+  
+  require(
+    inputAAlloc.dataType == inputBAlloc.dataType &&
+    inputBAlloc.dataType == outputAlloc.dataType,
+    s"MatMul operation requires all tensors to have the same data type. " +
+    s"Got: ${inputAAlloc.dataType}, ${inputBAlloc.dataType}, ${outputAlloc.dataType}"
+  )
+  
+  // Validate matrix dimensions for multiplication: A[M,K] * B[K,N] = C[M,N]
+  val shapeA = inputAAlloc.shape
+  val shapeB = inputBAlloc.shape
+  val shapeC = outputAlloc.shape
+  
+  require(
+    shapeA.length == 2 && shapeB.length == 2 && shapeC.length == 2,
+    s"MatMul requires 2D matrices. Got shapes: A=${shapeA}, B=${shapeB}, C=${shapeC}"
+  )
+  
+  val (m, k_a) = (shapeA(0), shapeA(1))
+  val (k_b, n) = (shapeB(0), shapeB(1))
+  val (m_c, n_c) = (shapeC(0), shapeC(1))
+  
+  require(
+    k_a == k_b,
+    s"MatMul dimension mismatch: A columns ($k_a) must equal B rows ($k_b)"
+  )
+  
+  require(
+    m == m_c && n == n_c,
+    s"MatMul output shape mismatch: expected [$m, $n], got [$m_c, $n_c]"
+  )
+  
+  // Validate supported data types
+  inputAAlloc.dataType match {
+    case DataType.Float32 | DataType.Float64 => () // Supported
+    case unsupported =>
+      throw new NotImplementedError(s"MatMul operation not implemented for data type: $unsupported")
+  }   
+  case other =>
+    throw new NotImplementedError(s"Operation not implemented: ${other.getClass.getSimpleName}")
+}
+
+/** A Resource that manages all memory for the graph execution.
+*   - Input and output tensors get direct pointers to the memory of their Scala arrays
+*     (zero-copy).
+*   - Intermediate and constant tensors are allocated in native memory using malloc. The
+*     Resource guarantees that all malloc'd memory is freed after execution.
+*/
+private def memoryResource(
+model: ModelIR,
+inputs: Map[String, Array[]],
+outputs: Map[String, Array[]],
+): Resource[IO, MemoryMap] = {
+val acquire = IO {
+val mallocedPtrs = ListBuffer.empty[Ptr[Byte]]
+val memoryMap = model.allocations.map { case (name, allocation) =>
+val ptr: Ptr[Byte] =
+if (inputs.contains(name)) {
+inputs(name).at(0).asInstanceOf[Ptr[Byte]]
+} else if (outputs.contains(name)) {
+outputs(name).at(0).asInstanceOf[Ptr[Byte]]
+} else {
+val totalBytes = (allocation.shape.product * allocation.dataType.sizeInBytes).toUSize
+val p = stdlib.malloc(totalBytes)
+if (p == null) throw new OutOfMemoryError(s"Failed to allocate tensor '$name'")
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+allocation.initialData.foreach(data =>
+          memcpy(p, data.at(0).asInstanceOf[Ptr[Byte]], data.length.toUSize),
+        )
+        mallocedPtrs += p
+        p
+      }
+    name -> ptr
+  }
+  (memoryMap.toMap, mallocedPtrs.toList)
+}
+
+Resource
+  .make(acquire) { case (_, ptrsToFree) =>
+    IO(ptrsToFree.foreach(stdlib.free))
+  }
+  .map(_._1)
+
+}
+
+/** Dispatches a single operation to its corresponding handler function. */
+private def executeOperation(
+op: Operation,
+memory: MemoryMap,
+model: ModelIR,
+): Resource[IO, IO[Unit]] =
+op match {
+case op: Operation.SVMClassifier => handleSvmClassifier(op, memory, model)
+case op: Operation.Add => Resource.pure(handleAdd(op, memory, model))
+case op: Operation.Mul => Resource.pure(handleMul(op, memory, model))
+case op: Operation.Cast => Resource.pure(handleCast(op, memory, model))
+case op: Operation.Relu => Resource.pure(handleRelu(op, memory, model))
+case op: Operation.Reshape => Resource.pure(handleReshape(op, memory, model))
+case op: Operation.Conv => Resource.pure(handleConv(op, memory, model))
+case op: Operation.MaxPool => Resource.pure(handleMaxPool(op, memory, model))
+case op: Operation.MatMul => Resource.pure(handleMatMul(op, memory, model))
+case other =>
+// This case is unreachable due to the pre-validation step.
+// It remains as a safeguard against internal logic errors.
+throw new NotImplementedError(s"Operation not implemented: ${other.getClass.getSimpleName}")
+}
+
+/** Handles element-wise addition for both Float32 and Float64 tensors. */
+private def handleAdd(op: Operation.Add, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
+val shapeA = model.allocations(op.inputs(0)).shape
+val shapeB = model.allocations(op.inputs(1)).shape
+val outputShape = model.allocations(op.outputs.head).shape
+val dataType = model.allocations(op.inputs(0)).dataType
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+if (shapeA == shapeB) {
+  // Fast path: same shapes, simple element-wise addition
+  val count = outputShape.product
+  dataType match {
+    case DataType.Float32 =>
+      val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CFloat]]
+      val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CFloat]]
+      val output = memory(op.outputs.head).asInstanceOf[Ptr[CFloat]]
+      var i = 0
+      while (i < count) {
+        !(output + i) = !(inputA + i) + !(inputB + i)
+        i += 1
+      }
+
+    case DataType.Float64 =>
+      val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CDouble]]
+      val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CDouble]]
+      val output = memory(op.outputs.head).asInstanceOf[Ptr[CDouble]]
+      var i = 0
+      while (i < count) {
+        !(output + i) = !(inputA + i) + !(inputB + i)
+        i += 1
+      }
+
+    case DataType.Int32 =>
+      val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CInt]]
+      val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CInt]]
+      val output = memory(op.outputs.head).asInstanceOf[Ptr[CInt]]
+      var i = 0
+      while (i < count) {
+        !(output + i) = !(inputA + i) + !(inputB + i)
+        i += 1
+      }
+
+    case DataType.Int64 =>
+      val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CLongLong]]
+      val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CLongLong]]
+      val output = memory(op.outputs.head).asInstanceOf[Ptr[CLongLong]]
+      var i = 0
+      while (i < count) {
+        !(output + i) = !(inputA + i) + !(inputB + i)
+        i += 1
+      }
+
+    case unsupported =>
+      throw new NotImplementedError(s"Add operation not implemented for data type: $unsupported")
+  }
+} else {
+  // Broadcasting path: different shapes
+  val outputCount = outputShape.product
+  
+  // Pre-calculate strides once (since validation confirmed compatibility, we know this will work)
+  val stridesA = calculateStrides(shapeA)
+  val stridesB = calculateStrides(shapeB)
+  val outputStrides = calculateStrides(outputShape)
+  
+  dataType match {
+    case DataType.Float32 =>
+      val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CFloat]]
+      val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CFloat]]
+      val output = memory(op.outputs.head).asInstanceOf[Ptr[CFloat]]
+      
+      var i = 0
+      while (i < outputCount) {
+        val idxA = calculateBroadcastIndex(i, outputShape, shapeA, outputStrides, stridesA)
+        val idxB = calculateBroadcastIndex(i, outputShape, shapeB, outputStrides, stridesB)
+        !(output + i) = !(inputA + idxA) + !(inputB + idxB)
+        i += 1
+      }
+
+    case DataType.Float64 =>
+      val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CDouble]]
+      val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CDouble]]
+      val output = memory(op.outputs.head).asInstanceOf[Ptr[CDouble]]
+      
+      var i = 0
+      while (i < outputCount) {
+        val idxA = calculateBroadcastIndex(i, outputShape, shapeA, outputStrides, stridesA)
+        val idxB = calculateBroadcastIndex(i, outputShape, shapeB, outputStrides, stridesB)
+        !(output + i) = !(inputA + idxA) + !(inputB + idxB)
+        i += 1
+      }
+
+    case unsupported =>
+      throw new NotImplementedError(s"Broadcast Add operation not implemented for data type: $unsupported")
+  }
+}
+
+}
+
+/** Handles element-wise multiplication for both Float32 and Float64 tensors. */
+private def handleMul(op: Operation.Mul, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
+val count = model.allocations(op.outputs.head).shape.product
+val inputAAlloc = model.allocations(op.inputs(0))
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+inputAAlloc.dataType match {
+  case DataType.Float32 =>
+    val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CFloat]]
+    val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CFloat]]
+    val output = memory(op.outputs.head).asInstanceOf[Ptr[CFloat]]
+
+    var i = 0
+    while (i < count) {
+      !(output + i) = !(inputA + i) * !(inputB + i)
+      i += 1
+    }
+
+  case DataType.Float64 =>
+    val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CDouble]]
+    val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CDouble]]
+    val output = memory(op.outputs.head).asInstanceOf[Ptr[CDouble]]
+
+    var i = 0
+    while (i < count) {
+      !(output + i) = !(inputA + i) * !(inputB + i)
+      i += 1
+    }
+
+  case DataType.Int32 =>
+    val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CInt]]
+    val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CInt]]
+    val output = memory(op.outputs.head).asInstanceOf[Ptr[CInt]]
+
+    var i = 0
+    while (i < count) {
+      !(output + i) = !(inputA + i) * !(inputB + i)
+      i += 1
+    }
+
+  case DataType.Int64 =>
+    val inputA = memory(op.inputs(0)).asInstanceOf[Ptr[CLongLong]]
+    val inputB = memory(op.inputs(1)).asInstanceOf[Ptr[CLongLong]]
+    val output = memory(op.outputs.head).asInstanceOf[Ptr[CLongLong]]
+
+    var i = 0
+    while (i < count) {
+      !(output + i) = !(inputA + i) * !(inputB + i)
+      i += 1
+    }
+
+  case unsupported =>
+    throw new NotImplementedError(s"Mul operation not implemented for data type: $unsupported")
+}
+
+}
+
+/** Handles casting between supported data types (Float32 <-> Float64). */
+private def handleCast(op: Operation.Cast, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
+val inputAlloc = model.allocations(op.input)
+val outputAlloc = model.allocations(op.output)
+val count = inputAlloc.shape.product
+val inputPtr = memory(op.input)
+val outputPtr = memory(op.output)
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+(inputAlloc.dataType, outputAlloc.dataType) match {
+  case (from, to) if from == to =>
+    ()
+
+  case (DataType.Float64, DataType.Float32) =>
+    val in = inputPtr.asInstanceOf[Ptr[CDouble]]
+    val out = outputPtr.asInstanceOf[Ptr[CFloat]]
+    var i = 0
+    while (i < count) {
+      !(out + i) = (!(in + i)).toFloat
+      i += 1
+    }
+
+  case (DataType.Float32, DataType.Float64) =>
+    val in = inputPtr.asInstanceOf[Ptr[CFloat]]
+    val out = outputPtr.asInstanceOf[Ptr[CDouble]]
+    var i = 0
+    while (i < count) {
+      !(out + i) = (!(in + i)).toDouble
+      i += 1
+    }
+
+  case (from, to) =>
+    // Unreachable due to pre-validation.
+    throw new IllegalStateException(s"Unvalidated cast from $from to $to encountered.")
+}
+
+}
+
+/** Handles the SVMClassifier operation by constructing a native LibSvm model, performing the
+* prediction, and writing the results to the output tensors.
+/
+/* Handles the SVMClassifier operation using the C++ wrapper for robust LibSVM integration. This
+* approach eliminates struct layout issues and provides ONNX-compliant per-class scores.
+*/
+private def handleSvmClassifier(
+op: Operation.SVMClassifier,
+memory: MemoryMap,
+model: ModelIR,
+): Resource[IO, IO[Unit]] = {
+val numFeatures = model.allocations(op.input).shape.last
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+// Create SVM model using C++ wrapper with proper resource management
+createSvmModelResource(op, numFeatures).map { svmModel =>
+  IO {
+    // Get input and output pointers from memory map
+    val inputPtr = memory(op.input).asInstanceOf[Ptr[CDouble]]
+    val scoresPtr = memory(op.outputScores).asInstanceOf[Ptr[CDouble]]
+    val labelPtr = memory(op.outputLabel).asInstanceOf[Ptr[CInt]]
+
+    // Single function call - all complexity handled in C++
+    val predictedLabel = svm_predict_with_scores(
+      svmModel,
+      inputPtr,
+      numFeatures,
+      scoresPtr,
+    )
+
+    // Write back the predicted label
+    !labelPtr = predictedLabel
+
+    ()
+  }
+}
+
+}
+
+/** Creates an SVM model using the C++ wrapper functions with proper resource management. All
+* memory allocation and model construction is handled in C for maximum reliability.
+*/
+private def createSvmModelResource(
+op: Operation.SVMClassifier,
+numFeatures: Int,
+): Resource[IO, Ptr[Byte]] = {
+val nrClass = op.classLabels.size
+val numSupportVectors = op.vectorsPerClass.sum.toInt
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+for {
+  // Create SVM parameter using C++ wrapper
+  param <- createSvmParameterResource(op)
+
+  // Create managed arrays for model data
+  supportVectorsPtr <- createManagedDoubleArray(op.supportVectors)
+  coefficientsPtr <- createManagedDoubleArray(op.coefficients)
+  rhoPtr <- createManagedDoubleArray(op.rho.toArray)
+  classLabelsPtr <- createManagedIntArray(op.classLabels.map(_.toInt).toArray)
+  vectorsPerClassPtr <- createManagedIntArray(op.vectorsPerClass.map(_.toInt).toArray)
+
+  // Create the SVM model using C++ wrapper with LibSVM's native cleanup
+  svmModel <- Resource.make(IO {
+    create_svm_model(
+      param,
+      nrClass,
+      numSupportVectors,
+      supportVectorsPtr,
+      numFeatures,
+      coefficientsPtr,
+      rhoPtr,
+      classLabelsPtr,
+      vectorsPerClassPtr,
+    )
+  })(model =>
+    IO {
+      // Use LibSVM's native cleanup function
+      val modelPtrPtr = stdlib.malloc(sizeof[Ptr[Byte]]).asInstanceOf[Ptr[Ptr[Byte]]]
+      !modelPtrPtr = model
+      svm_free_and_destroy_model(modelPtrPtr)
+      stdlib.free(modelPtrPtr.asInstanceOf[Ptr[Byte]])
+    },
+  )
+
+} yield svmModel
+
+}
+
+/** Creates SVM parameter using C++ wrapper with proper resource management. */
+private def createSvmParameterResource(op: Operation.SVMClassifier): Resource[IO, Ptr[Byte]] = {
+val kernelType = op.kernelType match {
+case SVMKernel.Linear => 0
+case SVMKernel.Poly => 1
+case SVMKernel.Rbf => 2
+case SVMKernel.Sigmoid => 3
+}
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+val gamma = op.kernelParams.headOption.getOrElse(0.0)
+val coef0 = op.kernelParams.drop(1).headOption.getOrElse(0.0)
+val degree = op.kernelParams.drop(2).headOption.map(_.toInt).getOrElse(3)
+
+Resource.make(IO {
+  create_svm_param(
+    svm_type = 0, // C_SVC
+    kernel_type = kernelType,
+    degree = degree,
+    gamma = gamma,
+    coef0 = coef0,
+  )
+})(param => IO(stdlib.free(param)))
+
+}
+
+/** Helper to create managed double array for C++ wrapper calls. */
+private def createManagedDoubleArray(values: Array[Double]): Resource[IO, Ptr[CDouble]] =
+Resource.make(IO {
+val ptr = stdlib
+.malloc(sizeof[CDouble] * values.length.toUSize)
+.asInstanceOf[Ptr[CDouble]]
+if (ptr == null) throw new OutOfMemoryError(s"Failed to allocate ${values.length} doubles")
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+for (i <- values.indices)
+    ptr(i) = values(i)
+  ptr
+})(ptr => IO(stdlib.free(ptr.asInstanceOf[Ptr[Byte]])))
+
+/** Helper to create managed int array for C++ wrapper calls. */
+private def createManagedIntArray(values: Array[Int]): Resource[IO, Ptr[CInt]] =
+Resource.make(IO {
+val ptr = stdlib
+.malloc(sizeof[CInt] * values.length.toUSize)
+.asInstanceOf[Ptr[CInt]]
+if (ptr == null) throw new OutOfMemoryError(s"Failed to allocate ${values.length} ints")
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+for (i <- values.indices)
+    ptr(i) = values(i)
+  ptr
+})(ptr => IO(stdlib.free(ptr.asInstanceOf[Ptr[Byte]])))
+
+/** Creates empty Scala arrays for each graph output. These arrays will be pointed to by the
+* memoryResource and written to directly from native code.
+*/
+private def createOutputArrays(model: ModelIR): Map[String, Array[]] =
+model.graphOutputs.map { name =>
+val allocation = model.allocations(name)
+val size = allocation.shape.product
+val array: Array[] = allocation.dataType match {
+case DataType.Float32 => new ArrayFloat
+case DataType.Int32 => new ArrayInt
+case DataType.Float64 => new ArrayDouble
+case DataType.Int64 => new ArrayLong
+case other => throw new Exception(s"Unsupported output data type: $other")
+}
+name -> array
+}.toMap
+
+/** Handles ReLU activation function: output = max(0, input)
+
+Simple element-wise operation with good performance in Scala.
+*/
+private def handleRelu(op: Operation.Relu, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
+val count = model.allocations(op.output).shape.product
+val inputAlloc = model.allocations(op.input)
+
+inputAlloc.dataType match {
+case DataType.Float32 =>
+val input = memory(op.input).asInstanceOf[Ptr[CFloat]]
+val output = memory(op.output).asInstanceOf[Ptr[CFloat]]
+var i = 0
+while (i < count) {
+val value = !(input + i)
+!(output + i) = if (value > 0.0f) value else 0.0f
+i += 1
+}
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+case DataType.Float64 =>
+  val input = memory(op.input).asInstanceOf[Ptr[CDouble]]
+  val output = memory(op.output).asInstanceOf[Ptr[CDouble]]
+  var i = 0
+  while (i < count) {
+    val value = !(input + i)
+    !(output + i) = if (value > 0.0) value else 0.0
+    i += 1
+  }
+  
+    case unsupported =>
+  throw new NotImplementedError(s"ReLU operation not implemented for data type: $unsupported") //should never happen due to pre-validation
+
+}
+}
+/** Handles Reshape operation: changes the shape of a tensor without modifying its data.
+* This is a no-op in terms of data, but must ensure the output pointer is correctly set.
+*/
+private def handleReshape(op: Operation.Reshape, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
+val inputAlloc = model.allocations(op.input)
+val inputPtr = memory(op.input)
+val outputPtr = memory(op.output)
+val totalBytes = (inputAlloc.shape.product * inputAlloc.dataType.sizeInBytes).toUSize
+
+// Copy data from input to output (same data, different shape interpretation)
+memcpy(outputPtr, inputPtr, totalBytes)
+()
+}
+// BROADCASTING HELPER METHODS
+/** Calculates the broadcasted output shape following numpy broadcasting rules.
+
+Returns None if shapes are incompatible for broadcasting.
+*/
+private def calculateBroadcastShape(shapeA: List[Int], shapeB: List[Int]): Option[List[Int]] = {
+val maxDims = math.max(shapeA.length, shapeB.length)
+
+// Pad shapes with leading 1s
+val paddedA = List.fill(maxDims - shapeA.length)(1) ++ shapeA
+val paddedB = List.fill(maxDims - shapeB.length)(1) ++ shapeB
+
+// Use traverse to validate and transform dimensions
+paddedA.zip(paddedB).traverse { case (dimA, dimB) =>
+if (dimA == dimB) {
+Some(dimA)
+} else if (dimA == 1) {
+Some(dimB)
+} else if (dimB == 1) {
+Some(dimA)
+} else {
+None
+}
+}
+}
+
+/** Handles Convolution operation using tiny-cnn */
+private def handleConv(op: Operation.Conv, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
+val inputShape = model.allocations(op.input).shape
+val weightShape = model.allocations(op.weight).shape
+
+val inputPtr = memory(op.input).asInstanceOf[Ptr[CFloat]]
+val weightPtr = memory(op.weight).asInstanceOf[Ptr[CFloat]]
+val outputPtr = memory(op.output).asInstanceOf[Ptr[CFloat]]
+
+val outputChannels = weightShape(0)
+
+// Track if zero bias was allocated
+var zeroBiasPtr: Ptr[CFloat] = null
+var zeroBiasAllocated = false
+
+val biasPtr = op.bias match {
+case Some(biasName) =>
+memory(biasName).asInstanceOf[Ptr[CFloat]]
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+case None =>
+  zeroBiasAllocated = true
+  zeroBiasPtr = stdlib.malloc(sizeof[CFloat] * outputChannels.toUSize).asInstanceOf[Ptr[CFloat]]
+  if (zeroBiasPtr == null) throw new OutOfMemoryError(s"Failed to allocate zero bias for $outputChannels channels")
+  for (i <- 0 until outputChannels) {
+    !(zeroBiasPtr + i) = 0.0f
+  }
+  zeroBiasPtr
+
+}
+
+val padH = if (op.autoPad == AutoPad.SameUpper || op.autoPad == AutoPad.SameLower) {
+(op.kernelShape(0) - 1) / 2
+} else {
+op.pads.headOption.getOrElse(0)
+}
+
+val padW = if (op.autoPad == AutoPad.SameUpper || op.autoPad == AutoPad.SameLower) {
+(op.kernelShape(1) - 1) / 2
+} else {
+op.pads.drop(1).headOption.getOrElse(0)
+}
+
+val result = conv2d_single_inference(
+input_data = inputPtr,
+weights = weightPtr,
+bias = biasPtr,
+output = outputPtr,
+input_height = inputShape(2).asInstanceOf[CInt],
+input_width = inputShape(3).asInstanceOf[CInt],
+input_channels = inputShape(1).asInstanceOf[CInt],
+kernel_height = op.kernelShape(0).asInstanceOf[CInt],
+kernel_width = op.kernelShape(1).asInstanceOf[CInt],
+output_channels = weightShape(0).asInstanceOf[CInt],
+stride_h = op.strides(0).asInstanceOf[CInt],
+stride_w = op.strides(1).asInstanceOf[CInt],
+pad_h = padH.asInstanceOf[CInt],
+pad_w = padW.asInstanceOf[CInt]
+)
+
+// Free the zero bias if we allocated it
+if (zeroBiasAllocated) {
+stdlib.free(zeroBiasPtr.asInstanceOf[Ptr[Byte]])
+}
+
+if (result != 0) {
+throw new RuntimeException(s"Convolution operation failed with error code: $result")
+}
+}
+
+/** Handles MaxPool operation using tiny-cnn single inference */
+private def handleMaxPool(op: Operation.MaxPool, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
+val inputShape = model.allocations(op.input).shape   // [1, C, H, W] - batch size always 1
+
+val inputPtr = memory(op.input).asInstanceOf[Ptr[CFloat]]
+val outputPtr = memory(op.output).asInstanceOf[Ptr[CFloat]]
+
+// Single object processing - no batch dimension handling
+val result =  maxpool2d_single_inference(
+input_data = inputPtr,
+output = outputPtr,
+// Input dimensions (single sample - shape[0] ignored, always 1)
+input_height = inputShape(2).asInstanceOf[CInt],
+input_width = inputShape(3).asInstanceOf[CInt],
+channels = inputShape(1).asInstanceOf[CInt],
+// Pooling parameters
+kernel_height = op.kernelShape(0).asInstanceOf[CInt],
+kernel_width = op.kernelShape(1).asInstanceOf[CInt],
+stride_h = op.strides(0).asInstanceOf[CInt],
+stride_w = op.strides(1).asInstanceOf[CInt],
+pad_h = 0.asInstanceOf[CInt],  // MaxPool typically doesn't use padding
+pad_w = 0.asInstanceOf[CInt]
+)
+
+if (result != 0) {
+throw new RuntimeException(s"MaxPool operation failed with error code: $result")
+}
+}
+
+/** Handles Matrix Multiplication using OpenBLAS CBLAS functions.
+
+Performs C = A * B where A is [M, K], B is [K, N], and C is [M, N].
+*/
+private def handleMatMul(op: Operation.MatMul, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
+val inputAAlloc = model.allocations(op.inputA)
+val inputBAlloc = model.allocations(op.inputB)
+
+val shapeA = inputAAlloc.shape
+val shapeB = inputBAlloc.shape
+
+val M = shapeA(0)  // rows of A and C
+val K = shapeA(1)  // cols of A, rows of B
+val N = shapeB(1)  // cols of B and C
+
+val inputAPtr = memory(op.inputA)
+val inputBPtr = memory(op.inputB)
+val outputPtr = memory(op.output)
+
+inputAAlloc.dataType match {
+case DataType.Float32 =>
+cblas_sgemm(
+layout = CblasRowMajor,
+transA = CblasNoTrans,
+transB = CblasNoTrans,
+M = M,
+N = N,
+K = K,
+alpha = 1.0f,
+A = inputAPtr.asInstanceOf[Ptr[CFloat]],
+lda = K,  // leading dimension of A (number of columns)
+B = inputBPtr.asInstanceOf[Ptr[CFloat]],
+ldb = N,  // leading dimension of B
+beta = 0.0f,
+C = outputPtr.asInstanceOf[Ptr[CFloat]],
+ldc = N   // leading dimension of C
+)
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+case DataType.Float64 =>
+  cblas_dgemm(
+    layout = CblasRowMajor,
+    transA = CblasNoTrans,
+    transB = CblasNoTrans,
+    M = M,
+    N = N,
+    K = K, 
+    alpha = 1.0,
+    A = inputAPtr.asInstanceOf[Ptr[CDouble]],
+    lda = K,
+    B = inputBPtr.asInstanceOf[Ptr[CDouble]], 
+    ldb = N,
+    beta = 0.0,
+    C = outputPtr.asInstanceOf[Ptr[CDouble]],
+    ldc = N
+  )
+  
+case unsupported =>
+  // This should never happen due to pre-validation
+  throw new IllegalStateException(s"Unvalidated MatMul data type: $unsupported")
+
+}
+}
+
+/** Calculate row-major strides for a given shape */
+private def calculateStrides(shape: List[Int]): List[Int] = {
+val strides = Array.fill(shape.length)(1)
+for (i <- shape.length - 2 to 0 by -1) {
+strides(i) = strides(i + 1) * shape(i + 1)
+}
+strides.toList
+}
+
+/** Calculate input index from output linear index considering broadcasting with pre-computed strides */
+private def calculateBroadcastIndex(
+linearIndex: Int,
+outputShape: List[Int],
+inputShape: List[Int],
+outputStrides: List[Int],
+inputStrides: List[Int]
+): Int = {
+// Pad input shape with leading 1s
+val paddedInput = List.fill(outputShape.length - inputShape.length)(1) ++ inputShape
+val paddedInputStrides = List.fill(outputShape.length - inputStrides.length)(0) ++ inputStrides
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+var remaining = linearIndex
+var inputIndex = 0
+
+for (dim <- outputShape.indices) {
+  val coord = remaining / outputStrides(dim)
+  remaining = remaining % outputStrides(dim)
+  
+  // If input dimension is 1, it's broadcasted (use coordinate 0)
+  val inputCoord = if (paddedInput(dim) == 1) 0 else coord
+  inputIndex += inputCoord * paddedInputStrides(dim)
+}
+
+inputIndex
+
+}
+}
+
+runtime/src/main/scala/com/armanbilge/vilcacora/runtime/TinyCNN.scala
+/*
+
+Copyright 2023 Arman Bilge
+
+Licensed under the Apache License, Version 2.0 (the "License");
+
+you may not use this file except in compliance with the License.
+
+You may obtain a copy of the License at
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+
+distributed under the License is distributed on an "AS IS" BASIS,
+
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+See the License for the specific language governing permissions and
+
+limitations under the License.
+*/
+
+package com.armanbilge.vilcacora.runtime
+
+import scala.scalanative.unsafe._
+
+/** Scala Native bindings for tiny-cnn C++ wrapper functions */
+
+@linkCppRuntime
+@extern
+object TinyCNN {
+
+// Single inference convolution - NO BATCHING
+def conv2d_single_inference(
+input_data: Ptr[CFloat],    // Single input tensor
+weights: Ptr[CFloat],       // Convolution weights
+bias: Ptr[CFloat],          // Bias values
+output: Ptr[CFloat],        // Output buffer
+// Input dimensions (single sample)
+input_height: CInt,
+input_width: CInt,
+input_channels: CInt,
+// Convolution parameters
+kernel_height: CInt,
+kernel_width: CInt,
+output_channels: CInt,
+stride_h: CInt,
+stride_w: CInt,
+pad_h: CInt,
+pad_w: CInt
+): CInt = extern
+
+// Single inference max pooling - NO BATCHING
+def maxpool2d_single_inference(
+input_data: Ptr[CFloat],    // Single input tensor
+output: Ptr[CFloat],        // Output buffer
+// Input dimensions (single sample)
+input_height: CInt,
+input_width: CInt,
+channels: CInt,
+// Pooling parameters
+kernel_height: CInt,
+kernel_width: CInt,
+stride_h: CInt,
+stride_w: CInt,
+pad_h: CInt,
+pad_w: CInt
+): CInt = extern
+
+// Utility functions
+def calculate_output_size(
+input_size: CInt,
+kernel_size: CInt,
+stride: CInt,
+padding: CInt
+): CInt = extern
+}
+
+runtime/src/main/scala/com/armanbilge/vilcacora/runtime/Blas.scala
+
+/*
+
+Copyright 2023 Arman Bilge
+
+Licensed under the Apache License, Version 2.0 (the "License");
+
+you may not use this file except in compliance with the License.
+
+You may obtain a copy of the License at
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+
+distributed under the License is distributed on an "AS IS" BASIS,
+
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+See the License for the specific language governing permissions and
+
+limitations under the License.
+*/
+
+package com.armanbilge.vilcacora.runtime
+
+import scala.scalanative.unsafe._
+
+/** CBLAS constants - defined outside the extern object */
+object BLASConstants {
+// CBLAS layout options
+final val CblasRowMajor: CInt = 101
+final val CblasColMajor: CInt = 102
+
+// CBLAS transpose options
+final val CblasNoTrans: CInt = 111
+final val CblasTrans: CInt = 112
+final val CblasConjTrans: CInt = 113
+}
+
+/** Scala Native bindings for OpenBLAS CBLAS functions */
+@link("openblas")
+@extern
+object BLAS {
+// Double precision matrix multiplication
+def cblas_dgemm(
+layout: CInt,
+transA: CInt,
+transB: CInt,
+M: CInt,
+N: CInt,
+K: CInt,
+alpha: CDouble,
+A: Ptr[CDouble],
+lda: CInt,
+B: Ptr[CDouble],
+ldb: CInt,
+beta: CDouble,
+C: Ptr[CDouble],
+ldc: CInt
+): Unit = extern
+
+// Single precision matrix multiplication
+def cblas_sgemm(
+layout: CInt,
+transA: CInt,
+transB: CInt,
+M: CInt,
+N: CInt,
+K: CInt,
+alpha: CFloat,
+A: Ptr[CFloat],
+lda: CInt,
+B: Ptr[CFloat],
+ldb: CInt,
+beta: CFloat,
+C: Ptr[CFloat],
+ldc: CInt
+): Unit = extern
+}
+
+runtime/src/main/resources/scala-native/tinycnn_wrapper.cpp
+
+#include <vector>
+#include <cstring>
+#include <memory>
+
+#include "tiny_cnn/tiny_cnn.h"
+
+using namespace tiny_cnn;
+using namespace tiny_cnn::activation;
+
+extern "C" {
+
+// Calculate output dimension after conv/pool operation
+int calculate_output_size(int input_size, int kernel_size, int stride, int padding) {
+return (input_size + 2 * padding - kernel_size) / stride + 1;
+}
+
+// Single inference convolution - NO BATCHING
+int conv2d_single_inference(
+const float* input_data,    // Single input tensor
+const float* weights,       // Convolution weights
+const float* bias,          // Bias values
+float* output,              // Output buffer
+// Input dimensions (single sample)
+int input_height,
+int input_width,
+int input_channels,
+// Convolution parameters
+int kernel_height,
+int kernel_width,
+int output_channels,
+int stride_h,
+int stride_w,
+int pad_h,
+int pad_w
+) {
+// Create tiny-cnn layer
+padding pad_type = (pad_h > 0 || pad_w > 0) ? padding::same : padding::valid;
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+convolutional_layer<identity> conv_layer(
+    input_width, input_height, kernel_width, 
+    input_channels, output_channels, pad_type,
+    true, // has bias
+    stride_w, stride_h
+);
+
+// Get parameter references
+auto& W = conv_layer.weight();
+auto& b = conv_layer.bias();
+size_t weight_size = W.size();
+size_t bias_size = b.size();
+
+// Set weights and bias
+for (size_t i = 0; i < weight_size; ++i) {
+    W[i] = weights[i];
+}
+for (size_t i = 0; i < bias_size; ++i) {
+    b[i] = bias[i];
+}
+
+// Convert single input to tiny-cnn format
+int input_size = input_channels * input_height * input_width;
+vec_t input_vec(input_size);
+
+for (int i = 0; i < input_size; i++) {
+    input_vec[i] = static_cast<float>(input_data[i]);
+}
+
+// Forward propagation
+const vec_t& result = conv_layer.forward_propagation(input_vec, 0);
+
+// Copy result to output buffer
+for (size_t i = 0; i < result.size(); i++) {
+    output[i] = static_cast<float>(result[i]);
+}
+
+return 0; // Success
+
+}
+
+// Single inference max pooling - NO BATCHING
+int maxpool2d_single_inference(
+const float* input_data,    // Single input tensor
+float* output,              // Output buffer
+// Input dimensions (single sample)
+int input_height,
+int input_width,
+int channels,
+// Pooling parameters
+int kernel_height,
+int kernel_width,
+int stride_h,
+int stride_w,
+int pad_h,
+int pad_w
+) {
+// Create tiny-cnn max pooling layer
+max_pooling_layer<identity> pool_layer(
+input_width, input_height, channels,
+kernel_width, stride_w
+);
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+// Convert single input to tiny-cnn format
+int input_size = channels * input_height * input_width;
+vec_t input_vec(input_size);
+
+for (int i = 0; i < input_size; i++) {
+    input_vec[i] = static_cast<float>(input_data[i]);
+}
+
+// Forward propagation
+const vec_t& result = pool_layer.forward_propagation(input_vec, 0);
+
+// Copy result to output buffer
+for (size_t i = 0; i < result.size(); i++) {
+    output[i] = static_cast<float>(result[i]);
+}
+
+return 0; // Success
+
+}
+
+} // extern "C"
+
+onnx/src/main/scala/vilcacora/onnx/Translator.scala
+/*
+
+Copyright 2023 Arman Bilge
+
+Licensed under the Apache License, Version 2.0 (the "License");
+
+you may not use this file except in compliance with the License.
+
+You may obtain a copy of the License at
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+
+distributed under the License is distributed on an "AS IS" BASIS,
+
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+See the License for the specific language governing permissions and
+
+limitations under the License.
+*/
+
+package vilcacora.onnx
+
+import com.armanbilge.vilcacora.ir._
+import vilcacora.onnx.proto._
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import cats.syntax.all._
+
+/** Translates an ONNX ModelProto into a custom, type-safe ModelIR.
+*
+
+The primary goals of this translator are:
+
+To convert the protobuf-based ONNX graph into a more easily consumable Scala ADT. 2. To
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+resolve all memory requirements at compile-time by creating `Allocation` objects for every
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+tensor (inputs, outputs, weights, and intermediate results).
+
+*/
+object Translator {
+
+/** The main entry point for translation.
+*
+* @param model
+*   The ONNX model loaded from a protobuf file.
+*
+* @return
+*   An Either containing the translated ModelIR on success, or an error message on failure.
+*/
+def translate(model: ModelProto): Either[String, ModelIR] =
+for {
+graph <- model.graph.toRight("Model does not contain a graph")
+allocations <- buildAllocations(graph)
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+// Translate all nodes into IR operations.
+
+  operations <- graph.node.toList.traverse(translateNode)
+
+  graphInputs = graph.input.map(_.name)
+  graphOutputs = graph.output.map(_.name)
+
+} yield ModelIR(
+  name = graph.name,
+  operations = operations,
+  allocations = allocations,
+  graphInputs = graphInputs.toList,
+  graphOutputs = graphOutputs.toList,
+)
+
+/** Validates that an ONNX node has the expected number of inputs and outputs. This prevents
+* runtime errors from unsafe access like .head or (1).
+*/
+private[onnx] def checkArity(
+node: NodeProto,
+expectedInputs: Int,
+expectedOutputs: Int,
+): Either[String, Unit] =
+if (node.input.size == expectedInputs && node.output.size == expectedOutputs) {
+Right(())
+} else {
+Left(
+s"Node '${node.name}' (opType: ${node.opType}) expects $expectedInputs inputs and $expectedOutputs outputs, but got ${node.input.size} and ${node.output.size}",
+)
+}
+
+/** Gathers all tensor definitions from the graph and creates a map of named Allocation objects.
+* This includes inputs, outputs, constant initializers, and intermediate tensors.
+*/
+private[onnx] def buildAllocations(
+graph: GraphProto,
+): Either[String, Map[String, Allocation]] = {
+// Collect all tensor declarations (which define shape and type).
+val allValueProtos = graph.input ++ graph.valueInfo ++ graph.output
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+// Create allocations for declared tensors (without initial data).
+val valueAllocations: Either[String, List[Allocation]] = allValueProtos
+  .distinctBy(_.name)
+  .toList
+  .traverse(valueInfo => createAllocation(valueInfo, None))
+
+// Create allocations for constant tensors, which include initial data.
+val initializerAllocations: Either[String, List[Allocation]] =
+  graph.initializer.toList.traverse(createAllocationFromInitializer)
+// This new section manually creates allocations for intermediate tensors
+// that are not explicitly declared in the ONNX graph's value_info.
+
+val manuallyCreatedAllocs = for {
+  valAllocs <- valueAllocations
+  initAllocs <- initializerAllocations
+  // Create a temporary map of all known allocations so far for lookups.
+  existingAllocs = (valAllocs ++ initAllocs).map(a => a.name -> a).toMap
+
+  // Iterate through all nodes to find any that need special handling.
+  newAllocs <- graph.node.toList.flatTraverse { node =>
+    node.opType match {
+      case "SVMClassifier" =>
+        for {
+          _ <- checkArity(node, 1, 2) // Ensure SVMClassifier has 2 outputs
+          scoresOutputName = node.output(1)
+          // Check if an allocation for the scores tensor already exists.
+          allocations <-
+            if (existingAllocs.contains(scoresOutputName)) {
+              // If it exists, we don't need to do anything.
+              Right(List.empty[Allocation])
+            } else {
+              // If it doesn't exist, create it manually.
+              for {
+                // Get the input tensor's allocation to infer the batch size.
+                inputAlloc <- existingAllocs
+                  .get(node.input.head)
+                  .toRight(
+                    s"SVM input '${node.input.head}' not found in allocations.",
+                  )
+                batchSize <- inputAlloc.shape.headOption.toRight(
+                  s"Input '${inputAlloc.name}' for SVM has no dimensions.",
+                )
+
+                // Get the number of classes from the node's attributes.
+                attributes = new OnnxAttributeHelper(node)
+                classLabels <- attributes.getInts("classlabels_ints")
+                numClasses = classLabels.size
+
+                // The ONNX spec defines the scores output as a float tensor.
+                // We default to Float32. Shape is [batch_size, num_classes].
+                scoresAlloc = Allocation(
+                  name = scoresOutputName,
+                  dataType = DataType.Float32,
+                  shape = List(batchSize.toInt, numClasses),
+                  initialData = None,
+                )
+              } yield List(scoresAlloc)
+            }
+        } yield allocations
+
+      case _ =>
+        // For all other operators, we assume their outputs are properly declared.
+        Right(List.empty[Allocation])
+    }
+  }
+} yield newAllocs
+
+for {
+  valAllocs <- valueAllocations
+  initAllocs <- initializerAllocations
+  manualAllocs <- manuallyCreatedAllocs
+} yield (valAllocs ++ initAllocs ++ manualAllocs).map(a => a.name -> a).toMap
+
+}
+
+/** Translates a single ONNX NodeProto into its corresponding IR Operation.
+*/
+private[onnx] def translateNode(node: NodeProto): Either[String, Operation] = {
+val attributes = new OnnxAttributeHelper(node)
+node.opType match {
+// Group simple binary operators
+case "MatMul" | "Add" | "Mul" | "Div" =>
+for {
+// The arity check ensures the .head and (1) accessors below are safe.
+_ <- checkArity(node, expectedInputs = 2, expectedOutputs = 1)
+op <- node.opType match {
+case "MatMul" =>
+Right(Operation.MatMul(node.input.head, node.input(1), node.output.head))
+case "Add" => Right(Operation.Add(node.input.head, node.input(1), node.output.head))
+case "Mul" => Right(Operation.Mul(node.input.head, node.input(1), node.output.head))
+case "Div" => Right(Operation.Div(node.input.head, node.input(1), node.output.head))
+case _ => Left("Internal error: Unreachable code in operator matching")
+}
+} yield op
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+case "Cast" =>
+    for {
+      _ <- checkArity(node, expectedInputs = 1, expectedOutputs = 1)
+      toValue <- attributes.getInt("to")
+      dataType <- fromOnnxDataType(toValue.toInt)
+    } yield Operation.Cast(node.input.head, node.output.head, dataType)
+
+  case "SVMClassifier" =>
+    for {
+      _ <- checkArity(node, expectedInputs = 1, expectedOutputs = 2)
+      classLabels <- attributes.getInts("classlabels_ints")
+      coefficients <- attributes.getFloats("coefficients")
+      kernelParams <- attributes.getFloats("kernel_params")
+      kernelTypeStr <- attributes.getString("kernel_type")
+      kernelType <- SVMKernel.fromString(kernelTypeStr)
+      postTransformStr <- attributes.getString("post_transform")
+      postTransform <- PostTransform.fromString(postTransformStr)
+      rho <- attributes.getFloats("rho")
+      supportVectors <- attributes.getFloats("support_vectors")
+      vectorsPerClass <- attributes.getInts("vectors_per_class")
+    } yield Operation.SVMClassifier(
+      input = node.input.head,
+      outputLabel = node.output.head,
+      outputScores = node.output(1),
+      classLabels = classLabels.toList,
+      coefficients = coefficients.map(_.toDouble).toArray,
+      kernelType = kernelType,
+      kernelParams = kernelParams.map(_.toDouble).toList,
+      postTransform = postTransform,
+      rho = rho.map(_.toDouble).toList,
+      supportVectors = supportVectors.map(_.toDouble).toArray,
+      vectorsPerClass = vectorsPerClass.toList,
+    )
+
+  // Represents a ReLU (Rectified Linear Unit) activation operation.
+  case "Relu" =>
+    for {
+      _ <- checkArity(node, expectedInputs = 1, expectedOutputs = 1)
+    } yield Operation.Relu(node.input.head, node.output.head)
+
+  // Represents a Reshape operation.
+  case "Reshape" =>
+    for {
+      _ <- checkArity(node, expectedInputs = 2, expectedOutputs = 1)
+      // The 'allowzero' attribute is optional and defaults to 0 (false).
+      allowzero = node.attribute.find(_.name == "allowzero").map(_.i).getOrElse(0L) != 0L
+    } yield Operation.Reshape(
+      input = node.input.head,
+      shape = node.input(1),
+      output = node.output.head,
+      allowzero = allowzero,
+    )
+
+  // Represents a Convolution operation.
+  case "Conv" =>
+    for {
+      _ <-
+        if ((node.input.size == 2 || node.input.size == 3) && node.output.size == 1)
+          Right(())
+        else
+          Left(
+            s"Node '${node.name}' (opType: Conv) expects 2 or 3 inputs and 1 output, but got ${node.input.size} and ${node.output.size}",
+          )
+
+      // 'kernel_shape' is a required attribute.
+      kernelShape <- attributes.getInts("kernel_shape")
+
+      // Handle optional attributes with defaults as per ONNX specification.
+      autoPadStr = node.attribute
+        .find(_.name == "auto_pad")
+        .map(_.s.toStringUtf8())
+        .getOrElse("NOTSET")
+      autoPad <- AutoPad.fromString(autoPadStr)
+      group = node.attribute.find(_.name == "group").map(_.i).getOrElse(1L)
+
+      spatialDims = kernelShape.size
+      dilations = node.attribute
+        .find(_.name == "dilations")
+        .map(_.ints)
+        .getOrElse(Seq.fill(spatialDims)(1L))
+      pads = node.attribute
+        .find(_.name == "pads")
+        .map(_.ints)
+        .getOrElse(Seq.fill(spatialDims * 2)(0L))
+      strides = node.attribute
+        .find(_.name == "strides")
+        .map(_.ints)
+        .getOrElse(Seq.fill(spatialDims)(1L))
+
+    } yield Operation.Conv(
+      input = node.input.head,
+      weight = node.input(1),
+      bias = if (node.input.size == 3) Some(node.input(2)) else None,
+      output = node.output.head,
+      autoPad = autoPad,
+      dilations = dilations.map(_.toInt).toList,
+      group = group.toInt,
+      kernelShape = kernelShape.map(_.toInt).toList,
+      pads = pads.map(_.toInt).toList,
+      strides = strides.map(_.toInt).toList,
+    )
+
+  // Represents a MaxPool operation.
+  case "MaxPool" =>
+    for {
+      // The IR only uses the first output, but ONNX can have a second (indices).
+      _ <-
+        if (node.input.size == 1 && node.output.nonEmpty) Right(())
+        else
+          Left(
+            s"Node '${node.name}' (opType: MaxPool) expects 1 input and at least 1 output, but got ${node.input.size} and ${node.output.size}",
+          )
+
+      // 'kernel_shape' is a required attribute.
+      kernelShape <- attributes.getInts("kernel_shape")
+
+      // Handle optional attributes with defaults.
+      autoPadStr = node.attribute
+        .find(_.name == "auto_pad")
+        .map(_.s.toStringUtf8())
+        .getOrElse("NOTSET")
+      autoPad <- AutoPad.fromString(autoPadStr)
+      ceilMode = node.attribute.find(_.name == "ceil_mode").map(_.i).getOrElse(0L) != 0L
+      storageOrder = node.attribute.find(_.name == "storage_order").map(_.i).getOrElse(0L)
+
+      spatialDims = kernelShape.size
+      dilations = node.attribute
+        .find(_.name == "dilations")
+        .map(_.ints)
+        .getOrElse(Seq.fill(spatialDims)(1L))
+      pads = node.attribute
+        .find(_.name == "pads")
+        .map(_.ints)
+        .getOrElse(Seq.fill(spatialDims * 2)(0L))
+      strides = node.attribute
+        .find(_.name == "strides")
+        .map(_.ints)
+        .getOrElse(Seq.fill(spatialDims)(1L))
+
+    } yield Operation.MaxPool(
+      input = node.input.head,
+      output = node.output.head,
+      autoPad = autoPad,
+      ceilMode = ceilMode,
+      dilations = dilations.map(_.toInt).toList,
+      kernelShape = kernelShape.map(_.toInt).toList,
+      pads = pads.map(_.toInt).toList,
+      storageOrder = storageOrder.toInt,
+      strides = strides.map(_.toInt).toList,
+    )
+  case "Constant" =>
+    for {
+      // A Constant node has 0 inputs and 1 output.
+      _ <- checkArity(node, expectedInputs = 0, expectedOutputs = 1)
+
+      // The constant's data is stored in a 'value' attribute of type TensorProto.
+      valueAttribute <- node.attribute
+        .find(_.name == "value")
+        .toRight(s"Constant node '${node.name}' is missing the 'value' attribute.")
+
+      tensorProto <- valueAttribute.t
+        .toRight(s"Attribute 'value' in Constant node '${node.name}' is not a tensor.")
+
+      // Use existing helpers to extract the data type and raw bytes.
+      dataType <- fromOnnxDataType(tensorProto.dataType)
+      shape = tensorProto.dims.map(_.toInt).toList
+      data <- extractBytes(tensorProto, dataType)
+
+    } yield Operation.Constant(
+      output = node.output.head,
+      value = data,
+      dataType = dataType,
+      shape = shape,
+    )
+
+  case unsupported => Left(s"Unsupported operation type: $unsupported")
+}
+
+}
+
+/** Creates an Allocation from a tensor declaration (ValueInfoProto). This is used for tensors
+* whose memory must be allocated but whose initial value is not known.
+*/
+private[onnx] def createAllocation(
+valueInfo: ValueInfoProto,
+initialData: Option[Array[Byte]],
+): Either[String, Allocation] =
+for {
+name <- Option(valueInfo.name).filter(_.nonEmpty).toRight("ValueInfo is missing a name")
+typeProto <- valueInfo.type.toRight(s"ValueInfo '
+name' is not a tensor type, but 
+name' has no shape")
+shape <- parseShape(shapeProto)
+} yield Allocation(name, dataType, shape, initialData)
+
+/** Creates an Allocation from a constant tensor (TensorProto). This is used for weights and
+* biases, and includes extracting the raw byte data.
+*/
+private[onnx] def createAllocationFromInitializer(
+tensor: TensorProto,
+): Either[String, Allocation] =
+for {
+name <- Option(tensor.name).filter(.nonEmpty).toRight("Initializer is missing a name")
+dataType <- fromOnnxDataType(tensor.dataType)
+shape = tensor.dims.map(.toInt).toList
+data <- extractBytes(tensor, dataType)
+} yield Allocation(name, dataType, shape, Some(data))
+
+/** Converts an ONNX TensorShapeProto into a List[Int].
+*/
+private[onnx] def parseShape(shapeProto: TensorShapeProto): Either[String, List[Int]] =
+// traverse will attempt to convert each dimension. If any dimension fails
+// (returns a Left), the entire operation will fail and return that Left.
+shapeProto.dim.toList.traverse { dim =>
+dim.value match {
+// The success case: the dimension has a fixed integer value.
+case TensorShapeProto.Dimension.Value.DimValue(value) =>
+Right(value.toInt)
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+// The failure case: the dimension is a named parameter (e.g., 'N' or 'batch_size').
+    case TensorShapeProto.Dimension.Value.DimParam(name) =>
+      Left(
+        s"Model uses a dynamic dimension parameter ('$name'). This translator requires static shapes and does not handle dynamic inputs.",
+      )
+
+    // The failure case: the dimension is unspecified.
+    case TensorShapeProto.Dimension.Value.Empty =>
+      Left(
+        "Model has an unknown dimension. This translator requires static shapes.",
+      )
+  }
+}
+
+/** Maps an ONNX integer data type code to the corresponding IR DataType. */
+private[onnx] def fromOnnxDataType(onnxType: Int): Either[String, DataType] =
+onnxType match {
+case 1 => Right(DataType.Float32)
+case 11 => Right(DataType.Float64)
+case 10 => Right(DataType.Float16)
+case 16 => Right(DataType.BFloat16)
+case 6 => Right(DataType.Int32)
+case 7 => Right(DataType.Int64)
+case 5 => Right(DataType.Int16)
+case 3 => Right(DataType.Int8)
+case 12 => Right(DataType.UInt32)
+case 13 => Right(DataType.UInt64)
+case 4 => Right(DataType.UInt16)
+case 2 => Right(DataType.UInt8)
+case 9 => Right(DataType.Bool)
+case _ => Left(s"Unsupported ONNX data type code: $onnxType")
+}
+
+/** Extracts the tensor's weight data into a raw Array[Byte]. It prioritizes the efficient
+* rawData field. If that's empty, it falls back to reconstructing the byte array from typed
+* data fields (e.g., floatData).
+*/
+private[onnx] def extractBytes(
+tensor: TensorProto,
+dataType: DataType,
+): Either[String, Array[Byte]] =
+// The rawData field is the preferred and most common way to store tensor data.
+if (tensor.rawData.nonEmpty) {
+Right(tensor.rawData.toByteArray())
+} else {
+// Fallback for models that use the repeated typed fields instead.
+val elementCount = tensor.dims.map(_.toInt).product
+val buffer = ByteBuffer.allocate(elementCount * dataType.sizeInBytes)
+// ONNX standard specifies little-endian byte order.
+buffer.order(ByteOrder.LITTLE_ENDIAN)
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+tensor.dataType match {
+    case 1 => tensor.floatData.foreach(buffer.putFloat)
+    case 11 => tensor.doubleData.foreach(buffer.putDouble)
+    case 6 => tensor.int32Data.foreach(buffer.putInt)
+    case 7 => tensor.int64Data.foreach(buffer.putLong)
+    // Note: Other types like int16 are typically stored in `rawData` or `int32Data`.
+    case unsupportedType =>
+      return Left(
+        s"Extracting typed data for tensor '${tensor.name}' is not supported for type code $unsupportedType. The data should be in the 'raw_data' field.",
+      )
+  }
+  Right(buffer.array())
+}
+
+/** A private helper class to simplify and safely access attributes from a NodeProto. This
+* encapsulates the boilerplate of finding an attribute by name and extracting its typed value.
+*/
+private class OnnxAttributeHelper(node: NodeProto) {
+private val attributeMap: Map[String, AttributeProto] =
+node.attribute.map(attr => attr.name -> attr).toMap
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+def getString(name: String): Either[String, String] =
+  attributeMap
+    .get(name)
+    .toRight(s"Missing attribute '$name' in node '${node.name}'")
+    .map(_.s.toStringUtf8())
+
+def getInt(name: String): Either[String, Long] =
+  attributeMap.get(name).toRight(s"Missing attribute '$name' in node '${node.name}'").map(_.i)
+
+def getFloats(name: String): Either[String, Seq[Float]] =
+  attributeMap
+    .get(name)
+    .toRight(s"Missing attribute '$name' in node '${node.name}'")
+    .map(_.floats)
+
+def getInts(name: String): Either[String, Seq[Long]] =
+  attributeMap
+    .get(name)
+    .toRight(s"Missing attribute '$name' in node '${node.name}'")
+    .map(_.ints)
+
+}
+}
+
+ir/src/main/scala/com/armanbilge/vilcacora/ir/ModelIR.scala
+
+/*
+
+Copyright 2023 Arman Bilge
+
+Licensed under the Apache License, Version 2.0 (the "License");
+
+you may not use this file except in compliance with the License.
+
+You may obtain a copy of the License at
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+
+distributed under the License is distributed on an "AS IS" BASIS,
+
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+See the License for the specific language governing permissions and
+
+limitations under the License.
+*/
+
+package com.armanbilge.vilcacora.ir
+
+/** Represents the data type of a tensor's elements and its size in bytes.
+*/
+sealed abstract class DataType { def sizeInBytes: Int }
+object DataType {
+case object Float32 extends DataType { override def sizeInBytes: Int = 4 }
+case object Float64 extends DataType { override def sizeInBytes: Int = 8 } // For ONNX DOUBLE
+case object Float16 extends DataType { override def sizeInBytes: Int = 2 }
+case object BFloat16 extends DataType { override def sizeInBytes: Int = 2 }
+
+case object Int64 extends DataType { override def sizeInBytes: Int = 8 }
+case object Int32 extends DataType { override def sizeInBytes: Int = 4 }
+case object Int16 extends DataType { override def sizeInBytes: Int = 2 }
+case object Int8 extends DataType { override def sizeInBytes: Int = 1 }
+
+case object UInt64 extends DataType { override def sizeInBytes: Int = 8 }
+case object UInt32 extends DataType { override def sizeInBytes: Int = 4 }
+case object UInt16 extends DataType { override def sizeInBytes: Int = 2 }
+case object UInt8 extends DataType { override def sizeInBytes: Int = 1 }
+
+case object Bool extends DataType { override def sizeInBytes: Int = 1 }
+// Add other supported types  from ONNX
+}
+
+/** Describes a single, named memory buffer (a tensor).
+*/
+final case class Allocation(
+name: String,
+dataType: DataType,
+shape: List[Int],
+initialData: Option[Array[Byte]] = None,
+)
+
+/** representation of the kernel_type attribute for SVM nodes.
+*/
+sealed abstract class SVMKernel
+object SVMKernel {
+case object Linear extends SVMKernel
+case object Poly extends SVMKernel
+case object Rbf extends SVMKernel
+case object Sigmoid extends SVMKernel
+
+def fromString(s: String): Either[String, SVMKernel] = s.toUpperCase match {
+case "LINEAR" => Right(Linear)
+case "POLY" => Right(Poly)
+case "RBF" => Right(Rbf)
+case "SIGMOID" => Right(Sigmoid)
+case other => Left(s"Unsupported SVM Kernel: $other")
+}
+}
+
+/** Type-safe representation of the post_transform attribute for SVM nodes. */
+sealed abstract class PostTransform
+object PostTransform {
+case object None extends PostTransform
+case object Softmax extends PostTransform
+case object Logistic extends PostTransform
+case object Softmax_Zero extends PostTransform
+case object Probit extends PostTransform
+
+def fromString(s: String): Either[String, PostTransform] = s.toUpperCase match {
+case "NONE" => Right(None)
+case "SOFTMAX" => Right(Softmax)
+case "LOGISTIC" => Right(Logistic)
+case "SOFTMAX_ZERO" => Right(Softmax_Zero)
+case "PROBIT" => Right(Probit)
+case other => Left(s"Unsupported PostTransform: $other")
+}
+}
+
+/** Representation of auto_pad attribute for Conv and Pool operations.
+*/
+sealed abstract class AutoPad
+object AutoPad {
+case object NotSet extends AutoPad
+case object SameUpper extends AutoPad
+case object SameLower extends AutoPad
+case object Valid extends AutoPad
+
+def fromString(s: String): Either[String, AutoPad] = s.toUpperCase match {
+case "NOTSET" => Right(NotSet)
+case "SAME_UPPER" => Right(SameUpper)
+case "SAME_LOWER" => Right(SameLower)
+case "VALID" => Right(Valid)
+case other => Left(s"Unsupported AutoPad: $other")
+}
+}
+
+/** An ADT representing a single operation in the computation graph.
+*/
+sealed abstract class Operation {
+def inputs: List[String]
+def outputs: List[String]
+}
+
+object Operation {
+final case class MatMul(inputA: String, inputB: String, output: String) extends Operation {
+override def inputs: List[String] = List(inputA, inputB)
+override def outputs: List[String] = List(output)
+}
+
+final case class Add(inputA: String, inputB: String, output: String) extends Operation {
+override def inputs: List[String] = List(inputA, inputB)
+override def outputs: List[String] = List(output)
+}
+
+// Operation for element wise multiplication
+final case class Mul(inputA: String, inputB: String, output: String) extends Operation {
+override def inputs: List[String] = List(inputA, inputB)
+override def outputs: List[String] = List(output)
+}
+
+// Operation for changing a tensor's data type
+final case class Cast(input: String, output: String, to: DataType) extends Operation {
+override def inputs: List[String] = List(input)
+override def outputs: List[String] = List(output)
+}
+
+/** Represents an SVMClassifier operation. All configuration attributes are stored as fields in
+* the case class.
+*/
+final case class SVMClassifier(
+input: String,
+outputLabel: String,
+outputScores: String,
+// --- Attributes ---
+classLabels: List[Long],
+coefficients: Array[Double],
+kernelType: SVMKernel,
+kernelParams: List[Double],
+postTransform: PostTransform,
+rho: List[Double],
+supportVectors: Array[Double],
+vectorsPerClass: List[Long],
+) extends Operation {
+override def inputs: List[String] = List(input)
+override def outputs: List[String] = List(outputLabel, outputScores)
+}
+
+/** Represents an SVMRegressor operation. All configuration attributes are stored as fields in
+* the case class.
+*/
+final case class SVMRegressor(
+input: String,
+output: String,
+// --- Attributes ---
+coefficients: Array[Double],
+kernelParams: List[Double],
+kernelType: SVMKernel,
+nSupports: Long,
+oneClass: Boolean,
+postTransform: PostTransform,
+rho: List[Double],
+supportVectors: Array[Double],
+) extends Operation {
+override def inputs: List[String] = List(input)
+override def outputs: List[String] = List(output)
+}
+
+/** Represents a Constant operation that produces a constant tensor.
+*/
+final case class Constant(
+output: String,
+// --- Attributes ---
+value: Array[Byte],
+dataType: DataType,
+shape: List[Int],
+) extends Operation {
+override def inputs: List[String] = List.empty
+override def outputs: List[String] = List(output)
+}
+
+/** Represents an element-wise division operation.
+*/
+final case class Div(inputA: String, inputB: String, output: String) extends Operation {
+override def inputs: List[String] = List(inputA, inputB)
+override def outputs: List[String] = List(output)
+}
+
+/** Represents a Convolution operation.
+*/
+final case class Conv(
+input: String,
+weight: String,
+bias: Option[String],
+output: String,
+// --- Attributes ---
+autoPad: AutoPad,
+dilations: List[Int],
+group: Int,
+kernelShape: List[Int],
+pads: List[Int],
+strides: List[Int],
+) extends Operation {
+override def inputs: List[String] = List(input, weight) ++ bias.toList
+override def outputs: List[String] = List(output)
+}
+
+/** Represents a ReLU (Rectified Linear Unit) activation operation.
+*/
+final case class Relu(input: String, output: String) extends Operation {
+override def inputs: List[String] = List(input)
+override def outputs: List[String] = List(output)
+}
+
+/** Represents a MaxPool operation.
+*/
+final case class MaxPool(
+input: String,
+output: String,
+// --- Attributes ---
+autoPad: AutoPad,
+ceilMode: Boolean,
+dilations: List[Int],
+kernelShape: List[Int],
+pads: List[Int],
+storageOrder: Int,
+strides: List[Int],
+) extends Operation {
+override def inputs: List[String] = List(input)
+override def outputs: List[String] = List(output)
+}
+
+/** Represents a Reshape operation. Takes a shape tensor as input following ONNX specification.
+*/
+final case class Reshape(
+input: String,
+shape: String, // Shape tensor input name
+output: String,
+// --- Attributes ---
+allowzero: Boolean = false,
+) extends Operation {
+override def inputs: List[String] = List(input, shape)
+override def outputs: List[String] = List(output)
+}
+// Add more operations here...
+}
+
+/** The top-level container for the entire parsed and translated model.
+*/
+case class ModelIR(
+name: String,
+operations: List[Operation],
+allocations: Map[String, Allocation],
+graphInputs: List[String],
+graphOutputs: List[String],
+)
+
+runtime/src/main/scala/com/armanbilge/vilcacora/runtime/Main.scala
+
+package com.armanbilge.vilcacora.runtime
+
+import cats.effect.{IO, IOApp}
+import com.armanbilge.vilcacora.ir._
+import vilcacora.onnx.Translator
+import vilcacora.onnx.proto.ModelProto
+import java.nio.file.{Files, Paths}
+
+object MainApp extends IOApp.Simple {
+
+// Helper to load the ONNX model from a file in the project's root directory.
+private def loadModelFromFile(path: String): IO[ModelProto] = IO {
+println(s"Loading model from: $path")
+val bytes = Files.readAllBytes(Paths.get(path))
+ModelProto.parseFrom(bytes)
+}
+
+// Create a simple synthetic MNIST-like input (28x28 grayscale image)
+// This creates a simple pattern that resembles a digit for testing
+private def createMNISTInput(): Array[Float] = {
+val image = Array.ofDim[Float](1 * 1 * 28 * 28) // Shape: [1, 1, 28, 28]
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+// Create a simple "7"-like pattern in the center
+// MNIST expects white foreground (1.0) on black background (0.0)
+for {
+  h <- 8 until 20  // height range
+  w <- 6 until 22  // width range
+} {
+  val idx = h * 28 + w
+  if (h == 8 || (w >= 18 && h <= 15)) {
+    image(idx) = 1.0f // White pixels for the "7" shape
+  }
+}
+
+image
+
+}
+
+// Create a checkerboard pattern for testing
+private def createCheckerboardInput(): Array[Float] = {
+val image = Array.ofDim[Float](1 * 1 * 28 * 28)
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+for {
+  h <- 0 until 28
+  w <- 0 until 28
+} {
+  val idx = h * 28 + w
+  // Create a simple checkerboard pattern
+  image(idx) = if ((h / 4 + w / 4) % 2 == 0) 1.0f else 0.0f
+}
+
+image
+
+}
+
+// Load an actual image file if available (optional)
+private def loadImageFromFile(imagePath: String): IO[Array[Float]] = IO {
+// This would require additional image processing libraries
+// For now, just return a synthetic pattern
+println(s"Note: Image loading from file not implemented, using synthetic data")
+createMNISTInput()
+}
+
+private def printImagePreview(image: Array[Float], width: Int = 28, height: Int = 28): Unit = {
+println("Input image preview (28x28):")
+for (h <- 0 until height) {
+for (w <- 0 until width) {
+val pixel = image(h * width + w)
+if (pixel > 0.5f) print("█") else print("·")
+}
+println()
+}
+println()
+}
+
+private def printClassificationResults(probabilities: Array[Float]): Unit = {
+println("Classification results:")
+println("Digit | Probability")
+println("------|------------")
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+probabilities.zipWithIndex.foreach { case (prob, digit) =>
+  println(f"  $digit   | ${prob * 100}%6.2f%%")
+}
+
+val predictedClass = probabilities.zipWithIndex.maxBy(_._1)._2
+val confidence = probabilities.max * 100
+println()
+println(f"Predicted digit: $predictedClass (confidence: $confidence%.2f%%)")
+
+}
+
+def run: IO[Unit] = {
+// 1. Load the MNIST-12 ONNX model and translate it
+val modelIRIO: IO[ModelIR] = for {
+modelProto <- loadModelFromFile("mnist12_static.onnx")
+_ <- IO.println("MNIST-12 model loaded. Translating to ModelIR...")
+modelIR <- IO.fromEither(
+Translator.translate(modelProto).left.map { errorMsg =>
+new RuntimeException(s"Translation failed: $errorMsg")
+}
+)
+_ <- IO.println("Translation successful.")
+_ <- IO.println(s"Model has ${modelIR.operations.length} operations")
+_ <- IO.println(s"Graph inputs: ${modelIR.graphInputs.mkString(", ")}")
+_ <- IO.println(s"Graph outputs: ${modelIR.graphOutputs.mkString(", ")}")
+} yield modelIR
+
+code
+Code
+download
+content_copy
+expand_less
+IGNORE_WHEN_COPYING_START
+IGNORE_WHEN_COPYING_END
+modelIRIO.flatMap { modelIR =>
+  // 2. Create input data for MNIST model
+  // The input tensor is typically named "Input3" or similar for MNIST-12
+  // We need to find the actual input name from the model
+  val inputTensorName = modelIR.graphInputs.headOption.getOrElse("Input3")
+  val inputShape = modelIR.allocations.get(inputTensorName).map(_.shape).getOrElse(List(1, 1, 28, 28))
+  
+  IO.println(s"Input tensor: '$inputTensorName' with shape: ${inputShape.mkString("x")}") >>
+  IO {
+    // Create synthetic MNIST input
+    val inputImage = createMNISTInput()
+    printImagePreview(inputImage)
+    inputImage
+  }.flatMap { inputImage =>
+    val inputData: Map[String, Array[Float]] = Map(inputTensorName -> inputImage)
+
+    IO.println("--- Running MNIST Inference ---") >>
+    
+    // 3. Execute the model via the interpreter
+    Interpreter.execute(modelIR, inputData).use { ioResult =>
+      ioResult.flatMap { outputMap =>
+        IO.println("Inference successful!") >>
+        IO {
+          println("\n--- MNIST Classification Results ---")
+          outputMap.foreach { case (name, array) =>
+            println(s"\nOutput tensor '$name':")
+            array match {
+              case probArray: Array[Float] if probArray.length == 10 =>
+                // Standard MNIST has 10 classes (digits 0-9)
+                printClassificationResults(probArray)
+              case probArray: Array[Double] if probArray.length == 10 =>
+                val floatArray = probArray.map(_.toFloat)
+                printClassificationResults(floatArray)
+              case arr: Array[Float] =>
+                println(s"Raw output: ${arr.mkString("Array(", ", ", ")")}")
+              case arr: Array[Double] =>
+                println(s"Raw output: ${arr.mkString("Array(", ", ", ")")}")
+              case arr: Array[Int] =>
+                println(s"Raw output: ${arr.mkString("Array(", ", ", ")")}")
+              case _ =>
+                println("Unknown output array type")
+            }
+          }
+        }
+      }
+    }
+  }
+}.handleErrorWith { err =>
+  IO.println(s"An error occurred: ${err.getMessage}") >>
+  IO.println(s"Stack trace: ${err.getStackTrace.take(10).mkString("\n")}")
+}
+
+}
+}
+
+as compared to onnx runtime
+
+import onnxruntime as ort
+import numpy as np
+
+Load ONNX model
+
+session = ort.InferenceSession("mnist12_static.onnx")
+
+Get input name
+
+input_name = session.get_inputs()[0].name
+print(f"Input name: {input_name}")
+
+Create the exact same '7'-like input pattern as your Scala code
+
+input_image = np.zeros((1, 1, 28, 28), dtype=np.float32)
+for h in range(8, 20):  # height range: 8 until 20
+for w in range(6, 22):  # width range: 6 until 22
+if h == 8 or (w >= 18 and h <= 15):
+input_image[0, 0, h, w] = 1.0
+
+Run inference - get raw output (no softmax)
+
+outputs = session.run(None, {input_name: input_image})
+raw_output = outputs[0].flatten()
+
+print("Raw output values:")
+print(raw_output.tolist())
+
+Format like your Scala output for easy comparison
+
+print("\nFormatted like Scala output:")
+for i, val in enumerate(raw_output):
+print(f"  {i}   | {val * 100:6.2f}%")
+
+predicted_class = np.argmax(raw_output)
+max_confidence = np.max(raw_output) * 100
+print(f"\nPredicted digit: {predicted_class} (confidence: {max_confidence:.2f}%)")
+
+i am getting wrong output
+
+scala output:
+
+12_static.onnx
+MNIST-12 model loaded. Translating to ModelIR...
+Translation successful.
+Model has 12 operations
+Graph inputs: Input3
+Graph outputs: Plus214_Output_0
+Input tensor: 'Input3' with shape: 1x1x28x28
+Input image preview (28x28):
+····························
+····························
+····························
+····························
+····························
+····························
+····························
+····························
+······████████████████······
+··················████······
+··················████······
+··················████······
+··················████······
+··················████······
+··················████······
+··················████······
+····························
+····························
+····························
+····························
+····························
+····························
+····························
+····························
+····························
+····························
+····························
+····························
+
+Inference successful!
+
+--- MNIST Classification Results ---
+
+Output tensor 'Plus214_Output_0':
+Classification results:
+Digit | Probability
+------|------------
+0   | -13.09%
+1   | -127.65%
+2   | 370.77%
+3   | -218.84%
+4   |  51.89%
+5   |  69.16%
+6   | -201.08%
+7   |  -9.18%
+8   | -102.89%
+9   | -66.77%
+
+Predicted digit: 2 (confidence: 370.77%)
+
+onnxruntime python output:
+
+Input name: Input3
+Raw output values:
+[5.993803977966309, 1.6763725280761719, 0.6143940687179565, 4.671304702758789, -9.58522891998291, -6.090495586395264, -12.23981761932373, 17.645915985107422, -4.799297332763672, -2.035896062850952]
+
+Formatted like Scala output:
+0   | 599.38%
+1   | 167.64%
+2   |  61.44%
+3   | 467.13%
+4   | -958.52%
+5   | -609.05%
+6   | -1223.98%
+7   | 1764.59%
+8   | -479.93%
+9   | -203.59%
+
+Predicted digit: 7 (confidence: 1764.59%)
+
+why is it so where am i going wrong
+
+
+and here is how tiny_cnn/layer/convolutional_layer
+
+/*
+    Copyright (c) 2013, Taiga Nomi
+    All rights reserved.
+    
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+    * Neither the name of the <organization> nor the
+    names of its contributors may be used to endorse or promote products
+    derived from this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY 
+    EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED 
+    WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE 
+    DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY 
+    DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES 
+    (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; 
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND 
+    ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS 
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+#pragma once
+#include "tiny_cnn/util/util.h"
+#include "tiny_cnn/util/image.h"
+#include "tiny_cnn/activations/activation_function.h"
+#include <deque>
+
+namespace tiny_cnn {
+
+struct connection_table {
+    connection_table() : rows_(0), cols_(0) {}
+    connection_table(const bool *ar, cnn_size_t rows, cnn_size_t cols) : connected_(rows * cols), rows_(rows), cols_(cols) {
+        std::copy(ar, ar + rows * cols, connected_.begin());
+    }
+    connection_table(cnn_size_t ngroups, cnn_size_t rows, cnn_size_t cols) : connected_(rows * cols, false), rows_(rows), cols_(cols) {
+        if (rows % ngroups || cols % ngroups) throw nn_error("invalid group size");
+
+        cnn_size_t row_group = rows / ngroups;
+        cnn_size_t col_group = cols / ngroups;
+
+        for (cnn_size_t g = 0; g < ngroups; g++) {
+            for (cnn_size_t r = 0; r < row_group; r++)
+              for (cnn_size_t c = 0; c < col_group; c++)
+                connected_[(r + g * row_group) * cols_ + c + g * col_group] = true;
+        }
+    }
+
+    bool is_connected(cnn_size_t x, cnn_size_t y) const {
+        return is_empty() ? true : connected_[y * cols_ + x];
+    }
+
+    bool is_empty() const {
+        return rows_ == 0 && cols_ == 0;
+    }
+
+    std::deque<bool> connected_;
+    cnn_size_t rows_;
+    cnn_size_t cols_;
+};
+
+enum class padding {
+    valid, ///< use valid pixels of input
+    same   ///< add zero-padding around input so as to keep image size
+};
+
+
+template<typename Activation = activation::identity>
+class convolutional_layer : public layer<Activation> {
+public:
+    typedef layer<Activation> Base;
+    CNN_USE_LAYER_MEMBERS;
+
+    using layer_base::out_size;
+
+    /**
+    * constructing convolutional layer
+    *
+    * @param in_width     [in] input image width
+    * @param in_height    [in] input image height
+    * @param window_size  [in] window(kernel) size of convolution
+    * @param in_channels  [in] input image channels (grayscale=1, rgb=3)
+    * @param out_channels [in] output image channels
+    * @param padding      [in] rounding strategy
+    *                          valid: use valid pixels of input only. output-size = (in-width - window_size + 1) * (in-height - window_size + 1) * out_channels
+    *                          same: add zero-padding to keep same width/height. output-size = in-width * in-height * out_channels
+    **/
+    convolutional_layer(cnn_size_t in_width,
+        cnn_size_t in_height,
+        cnn_size_t window_size,
+        cnn_size_t in_channels,
+        cnn_size_t out_channels,
+        padding pad_type = padding::valid,
+        bool has_bias = true,
+        cnn_size_t w_stride = 1,
+        cnn_size_t h_stride = 1)
+        : Base(in_width * in_height * in_channels, conv_out_dim(in_width, in_height, window_size, w_stride, h_stride, pad_type) * out_channels,
+            sqr(window_size) * in_channels * out_channels, has_bias ? out_channels : 0),
+        in_(in_width, in_height, in_channels),
+        in_padded_(in_length(in_width, window_size, pad_type), in_length(in_height, window_size, pad_type), in_channels),
+        out_(conv_out_length(in_width, window_size, w_stride, pad_type), conv_out_length(in_height, window_size, h_stride, pad_type), out_channels),
+        weight_(window_size, window_size, in_channels*out_channels),
+        pad_type_(pad_type),
+        w_stride_(w_stride), h_stride_(h_stride)
+    {
+        init();
+    }
+
+    /**
+    * constructing convolutional layer
+    *
+    * @param in_width         [in] input image width
+    * @param in_height        [in] input image height
+    * @param window_width  [in] window_width(kernel) size of convolution
+    * @param window_height [in] window_height(kernel) size of convolution
+    * @param in_channels   [in] input image channels (grayscale=1, rgb=3)
+    * @param out_channels  [in] output image channels
+    * @param padding       [in] rounding strategy
+    *                          valid: use valid pixels of input only. output-size = (in-width - window_width + 1) * (in-height - window_height + 1) * out_channels
+    *                          same: add zero-padding to keep same width/height. output-size = in-width * in-height * out_channels
+    **/
+    convolutional_layer(cnn_size_t in_width,
+        cnn_size_t in_height,
+        cnn_size_t window_width,
+        cnn_size_t window_height,
+        cnn_size_t in_channels,
+        cnn_size_t out_channels,
+        padding pad_type = padding::valid,
+        bool has_bias = true,
+        cnn_size_t w_stride = 1,
+        cnn_size_t h_stride = 1)
+        : Base(in_width * in_height * in_channels, conv_out_dim(in_width, in_height, window_width, window_height, w_stride, h_stride, pad_type) * out_channels,
+            window_width*window_height * in_channels * out_channels, has_bias ? out_channels : 0),
+        in_(in_width, in_height, in_channels),
+        in_padded_(in_length(in_width, window_width, pad_type), in_length(in_height, window_height, pad_type), in_channels),
+        out_(conv_out_length(in_width, window_width, w_stride, pad_type), conv_out_length(in_height, window_height, h_stride, pad_type), out_channels),
+        weight_(window_width, window_height, in_channels*out_channels),
+        pad_type_(pad_type),
+        w_stride_(w_stride), h_stride_(h_stride)
+    {
+        init();
+    }
+    /**
+    * constructing convolutional layer
+    *
+    * @param in_width         [in] input image width
+    * @param in_height        [in] input image height
+    * @param window_size      [in] window(kernel) size of convolution
+    * @param in_channels      [in] input image channels (grayscale=1, rgb=3)
+    * @param out_channels     [in] output image channels
+    * @param connection_table [in] definition of connections between in-channels and out-channels
+    * @param pad_type         [in] rounding strategy
+    *                               valid: use valid pixels of input only. output-size = (in-width - window_size + 1) * (in-height - window_size + 1) * out_channels
+    *                               same: add zero-padding to keep same width/height. output-size = in-width * in-height * out_channels
+    **/
+    convolutional_layer(cnn_size_t in_width,
+        cnn_size_t in_height,
+        cnn_size_t window_size,
+        cnn_size_t in_channels,
+        cnn_size_t out_channels,
+        const connection_table& connection_table,
+        padding pad_type = padding::valid,
+        bool has_bias = true,
+        cnn_size_t w_stride = 1,
+        cnn_size_t h_stride = 1
+        )
+        : Base(in_width * in_height * in_channels, conv_out_dim(in_width, in_height, window_size, w_stride, h_stride, pad_type) * out_channels,
+            sqr(window_size) * in_channels * out_channels, has_bias ? out_channels : 0),
+        tbl_(connection_table),
+        in_(in_width, in_height, in_channels),
+        in_padded_(in_length(in_width, window_size, pad_type), in_length(in_height, window_size, pad_type), in_channels),
+        out_(conv_out_length(in_width, window_size, w_stride, pad_type), conv_out_length(in_height, window_size, h_stride, pad_type), out_channels),
+        weight_(window_size, window_size, in_channels*out_channels),
+        pad_type_(pad_type),
+        w_stride_(w_stride), h_stride_(h_stride)
+    {
+        init();
+    }
+
+    /**
+    * constructing convolutional layer
+    *
+    * @param in_width         [in] input image width
+    * @param in_height        [in] input image height
+    * @param window_width  [in] window_width(kernel) size of convolution
+    * @param window_height [in] window_height(kernel) size of convolution
+    * @param in_channels      [in] input image channels (grayscale=1, rgb=3)
+    * @param out_channels     [in] output image channels
+    * @param connection_table [in] definition of connections between in-channels and out-channels
+    * @param pad_type         [in] rounding strategy
+    *                               valid: use valid pixels of input only. output-size = (in-width - window_size + 1) * (in-height - window_size + 1) * out_channels
+    *                               same: add zero-padding to keep same width/height. output-size = in-width * in-height * out_channels
+    **/
+    convolutional_layer(cnn_size_t in_width,
+        cnn_size_t in_height,
+        cnn_size_t window_width,
+        cnn_size_t window_height,
+        cnn_size_t in_channels,
+        cnn_size_t out_channels,
+        const connection_table& connection_table,
+        padding pad_type = padding::valid,
+        bool has_bias = true,
+        cnn_size_t w_stride = 1,
+        cnn_size_t h_stride = 1
+        )
+        : Base(in_width * in_height * in_channels, conv_out_dim(in_width, in_height, window_width, window_height, w_stride, h_stride, pad_type) * out_channels,
+            window_width*window_height * in_channels * out_channels, has_bias ? out_channels : 0),
+        tbl_(connection_table),
+        in_(in_width, in_height, in_channels),
+        in_padded_(in_length(in_width, window_width, pad_type), in_length(in_height, window_height, pad_type), in_channels),
+        out_(conv_out_length(in_width, window_width, w_stride, pad_type), conv_out_length(in_height, window_height, h_stride, pad_type), out_channels),
+        weight_(window_width, window_height, in_channels*out_channels),
+        pad_type_(pad_type),
+        w_stride_(w_stride), h_stride_(h_stride)
+    {
+        init();
+    }
+
+    ///< number of incoming connections for each output unit
+    virtual size_t fan_in_size() const override
+    {
+        return weight_.width_ * weight_.height_ * in_.depth_;
+    }
+
+    ///< number of outgoing connections for each input unit
+    virtual size_t fan_out_size() const override
+    {
+        return (weight_.width_ / w_stride_) * (weight_.height_ / h_stride_) * out_.depth_;
+    }
+
+    ///< number of connections
+    virtual size_t connection_size() const override
+    {
+        return out_.size() * fan_in_size();
+    }
+
+    virtual const vec_t& back_propagation_2nd(const vec_t& current_delta2) override
+    {
+        const vec_t& prev_out = *(prev_out_padded_[0]);
+        const activation::function& prev_h = prev_->activation_function();
+        vec_t* prev_delta = (pad_type_ == padding::same) ? &prev_delta2_padded_ : &prev_delta2_;
+
+        std::fill(prev_delta->begin(), prev_delta->end(), float_t(0));
+
+        // accumulate dw
+        for_i(in_.depth_, [&](int inc) {
+            for (cnn_size_t outc = 0; outc < out_.depth_; outc++) {
+
+                if (!tbl_.is_connected(outc, inc)) continue;
+
+                for (cnn_size_t wy = 0; wy < weight_.height_; wy++) {
+                    for (cnn_size_t wx = 0; wx < weight_.width_; wx++) {
+                        float_t dst = float_t(0);
+                        const float_t * prevo = &prev_out[in_padded_.get_index(wx, wy, inc)];
+                        const float_t * delta = &current_delta2[out_.get_index(0, 0, outc)];
+
+                        for (cnn_size_t y = 0; y < out_.height_; y++) {
+                            for (cnn_size_t x = 0; x < out_.width_; x++) {
+                                dst += sqr(prevo[y * in_padded_.width_ + x]) * delta[y * out_.width_ + x];
+                            }
+                        }
+                        Whessian_[weight_.get_index(wx, wy, in_.depth_ * outc + inc)] += dst;
+                    }
+                }
+            }
+        });
+
+        // accumulate db
+        if (!this->bhessian_.empty()) {
+            for (cnn_size_t outc = 0; outc < out_.depth_; outc++) {
+                const float_t *delta = &current_delta2[out_.get_index(0, 0, outc)];
+                this->bhessian_[outc] += std::accumulate(delta, delta + out_.width_ * out_.height_, float_t(0));
+            }
+        }
+
+        // propagate delta to previous layer
+        for_i(in_.depth_, [&](int inc) {
+            for (cnn_size_t outc = 0; outc < out_.depth_; outc++) {
+                if (!tbl_.is_connected(outc, inc)) continue;
+
+                const float_t *pw = &W_[weight_.get_index(0, 0, in_.depth_ * outc + inc)];
+                const float_t *pdelta_src = &current_delta2[out_.get_index(0, 0, outc)];
+                float_t *pdelta_dst = &(*prev_delta)[in_padded_.get_index(0, 0, inc)];
+
+                for (cnn_size_t y = 0; y < out_.height_; y++) {
+                    for (cnn_size_t x = 0; x < out_.width_; x++) {
+                        const float_t * ppw = pw;
+                        const float_t ppdelta_src = pdelta_src[y * out_.width_ + x];
+                        float_t * ppdelta_dst = pdelta_dst + y * h_stride_ * in_padded_.width_ + x * w_stride_;
+
+                        for (cnn_size_t wy = 0; wy < weight_.height_; wy++) {
+                            for (cnn_size_t wx = 0; wx < weight_.width_; wx++) {
+                                ppdelta_dst[wy * in_padded_.width_ + wx] += sqr(*ppw++) * ppdelta_src;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        for_i(parallelize_, in_padded_.size(), [&](int i) {
+            (*prev_delta)[i] *= sqr(prev_h.df(prev_out[i]));
+        });
+
+        if (pad_type_ == padding::same)
+            copy_and_unpad_delta(prev_delta2_padded_, prev_delta2_);
+
+        CNN_LOG_VECTOR(current_delta2, "[pc]curr-delta2");
+        CNN_LOG_VECTOR(prev_delta2_, "[pc]prev-delta2");
+        CNN_LOG_VECTOR(Whessian_, "[pc]whessian");
+
+        return prev_->back_propagation_2nd(prev_delta2_);
+    }
+
+    virtual const vec_t& forward_propagation(const vec_t& in_raw, size_t worker_index) override
+    {
+        copy_and_pad_input(in_raw, static_cast<int>(worker_index));
+
+        vec_t &a = a_[worker_index]; // w*x
+        vec_t &out = output_[worker_index]; // output
+        const vec_t &in = *(prev_out_padded_[worker_index]); // input
+        
+        std::fill(a.begin(), a.end(), float_t(0));
+
+        for_i(parallelize_, out_.depth_, [&](int o) {
+            for (cnn_size_t inc = 0; inc < in_.depth_; inc++) {
+                if (!tbl_.is_connected(o, inc)) continue;
+
+                const float_t *pw = &this->W_[weight_.get_index(0, 0, in_.depth_ * o + inc)];
+                const float_t *pi = &in[in_padded_.get_index(0, 0, inc)];
+                float_t *pa = &a[out_.get_index(0, 0, o)];
+
+                for (cnn_size_t y = 0; y < out_.height_; y++) {
+                    for (cnn_size_t x = 0; x < out_.width_; x++) {
+                        const float_t * ppw = pw;
+                        const float_t * ppi = pi + (y * h_stride_) * in_padded_.width_ + x * w_stride_;
+                        float_t sum = float_t(0);
+
+                        // should be optimized for small kernel(3x3,5x5)
+                        for (cnn_size_t wy = 0; wy < weight_.height_; wy++) {
+                            for (cnn_size_t wx = 0; wx < weight_.width_; wx++) {
+                                sum += *ppw++ * ppi[wy * in_padded_.width_ + wx];
+                            }
+                        }
+                        pa[y * out_.width_ + x] += sum;
+                    }
+                }
+            }
+
+            if (!this->b_.empty()) {
+                float_t *pa = &a[out_.get_index(0, 0, o)];
+                float_t b = this->b_[o];
+                std::for_each(pa, pa + out_.width_ * out_.height_, [&](float_t& f) { f += b; });
+            }
+        });
+
+        for_i(parallelize_, out_size_, [&](int i) {
+            out[i] = h_.f(a, i);
+        });
+
+        CNN_LOG_VECTOR(in_raw, "[pc]in");
+        CNN_LOG_VECTOR(W_, "[pc]w");
+        CNN_LOG_VECTOR(a, "[pc]a");
+        CNN_LOG_VECTOR(out, "[pc]forward");
+
+        return next_ ? next_->forward_propagation(out, worker_index) : out;
+    }
+
+    float_t& weight_at(cnn_size_t in_channel, cnn_size_t out_channel, cnn_size_t kernel_x, cnn_size_t kernel_y) {
+        return W_[weight_.get_index(kernel_x, kernel_y, in_.depth_ * out_channel + in_channel)];
+    }
+
+    const vec_t& back_propagation(const vec_t& curr_delta, size_t index) override {
+        const vec_t& prev_out = *(prev_out_padded_[index]);
+        const activation::function& prev_h = prev_->activation_function();
+        vec_t* prev_delta = (pad_type_ == padding::same) ? &prev_delta_padded_[index] : &prev_delta_[index];
+        vec_t& dW = dW_[index];
+        vec_t& db = db_[index];
+
+        std::fill(prev_delta->begin(), prev_delta->end(), float_t(0));
+
+        // propagate delta to previous layer
+        for_i(in_.depth_, [&](int inc) {
+            for (cnn_size_t outc = 0; outc < out_.depth_; outc++) {
+                if (!tbl_.is_connected(outc, inc)) continue;
+
+                const float_t *pw = &this->W_[weight_.get_index(0, 0, in_.depth_ * outc + inc)];
+                const float_t *pdelta_src = &curr_delta[out_.get_index(0, 0, outc)];
+                float_t *pdelta_dst = &(*prev_delta)[in_padded_.get_index(0, 0, inc)];
+
+                for (cnn_size_t y = 0; y < out_.height_; y++) {
+                    for (cnn_size_t x = 0; x < out_.width_; x++) {
+                        const float_t * ppw = pw;
+                        const float_t ppdelta_src = pdelta_src[y * out_.width_ + x];
+                        float_t * ppdelta_dst = pdelta_dst + y * h_stride_ * in_padded_.width_ + x * w_stride_;
+
+                        for (cnn_size_t wy = 0; wy < weight_.height_; wy++) {
+                            for (cnn_size_t wx = 0; wx < weight_.width_; wx++) {
+                                ppdelta_dst[wy * in_padded_.width_ + wx] += *ppw++ * ppdelta_src;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        for_i(parallelize_, in_padded_.size(), [&](int i) {
+            (*prev_delta)[i] *= prev_h.df(prev_out[i]);
+        });
+
+        // accumulate dw
+        for_i(in_.depth_, [&](int inc) {
+            for (cnn_size_t outc = 0; outc < out_.depth_; outc++) {
+
+                if (!tbl_.is_connected(outc, inc)) continue;
+
+                for (cnn_size_t wy = 0; wy < weight_.height_; wy++) {
+                    for (cnn_size_t wx = 0; wx < weight_.width_; wx++) {
+                        float_t dst = float_t(0);
+                        const float_t * prevo = &prev_out[in_padded_.get_index(wx, wy, inc)];
+                        const float_t * delta = &curr_delta[out_.get_index(0, 0, outc)];
+
+                        for (cnn_size_t y = 0; y < out_.height_; y++) {
+                            dst += vectorize::dot(prevo + y * in_padded_.width_, delta + y * out_.width_, out_.width_);
+                        }
+                        dW[weight_.get_index(wx, wy, in_.depth_ * outc + inc)] += dst;
+                    }
+                }
+            }
+        });
+
+        // accumulate db
+        if (!db.empty()) {
+            for (cnn_size_t outc = 0; outc < out_.depth_; outc++) {
+                const float_t *delta = &curr_delta[out_.get_index(0, 0, outc)];
+                db[outc] += std::accumulate(delta, delta + out_.width_ * out_.height_, float_t(0));
+            }
+        }
+
+        if (pad_type_ == padding::same)
+            copy_and_unpad_delta(prev_delta_padded_[index], prev_delta_[index]);
+
+        CNN_LOG_VECTOR(curr_delta, "[pc]curr_delta");
+        CNN_LOG_VECTOR(prev_delta_[index], "[pc]prev_delta");
+        CNN_LOG_VECTOR(dW, "[pc]dW");
+        CNN_LOG_VECTOR(db, "[pc]db");
+
+        return prev_->back_propagation(prev_delta_[index], index);
+    }
+
+    index3d<cnn_size_t> in_shape() const override { return in_; }
+    index3d<cnn_size_t> out_shape() const override { return out_; }
+    std::string layer_type() const override { return "conv"; }
+
+    image<> weight_to_image() const {
+        image<> img;
+        const cnn_size_t border_width = 1;
+        const auto pitch = weight_.width_ + border_width;
+        const auto width = out_.depth_ * pitch + border_width;
+        const auto height = in_.depth_ * pitch + border_width;
+        const image<>::intensity_t bg_color = 255;
+
+        img.resize(width, height);
+        img.fill(bg_color);
+
+        auto minmax = std::minmax_element(this->W_.begin(), this->W_.end());
+
+        for (cnn_size_t r = 0; r < in_.depth_; ++r) {
+            for (cnn_size_t c = 0; c < out_.depth_; ++c) {
+                if (!tbl_.is_connected(c, r)) continue;
+
+                const auto top = r * pitch + border_width;
+                const auto left = c * pitch + border_width;
+
+                for (cnn_size_t y = 0; y < weight_.height_; ++y) {
+                    for (cnn_size_t x = 0; x < weight_.width_; ++x) {
+                        const float_t w = W_[weight_.get_index(x, y, c * in_.depth_ + r)];
+
+                        img.at(left + x, top + y)
+                            = static_cast<image<>::intensity_t>(rescale(w, *minmax.first, *minmax.second, 0, 255));
+                    }
+                }
+            }
+        }
+        return img;
+    }
+
+private:
+    void init() {
+        for (cnn_size_t i = 0; i < CNN_TASK_SIZE; i++) {
+            if (pad_type_ == padding::same) {
+                prev_out_buf_[i] = new vec_t(in_padded_.size(), float_t(0));
+                prev_delta_padded_[i].resize(in_padded_.size(), float_t(0));               
+            }
+            else {
+                prev_out_buf_[i] = nullptr;
+            }
+        }
+        if (pad_type_ == padding::same) {
+            prev_delta2_padded_.resize(in_padded_.size(), float_t(0));
+        }
+    }
+
+    cnn_size_t in_length(cnn_size_t in_length, cnn_size_t window_size, padding pad_type) const {
+        return pad_type == padding::same ? (in_length + window_size - 1) : in_length;
+    }
+
+    static cnn_size_t conv_out_length(cnn_size_t in_length, cnn_size_t window_size, cnn_size_t stride, padding pad_type) {
+        return pad_type == padding::same ? (cnn_size_t)ceil((double)in_length / stride) : (cnn_size_t)ceil((double)(in_length - window_size + 1) / stride);
+    }
+
+    static cnn_size_t conv_out_dim(cnn_size_t in_width, cnn_size_t in_height, cnn_size_t window_size, cnn_size_t w_stride, cnn_size_t h_stride, padding pad_type) {
+        return conv_out_length(in_width, window_size, w_stride, pad_type) * conv_out_length(in_height, window_size, h_stride, pad_type);
+    }
+
+    cnn_size_t conv_out_dim(cnn_size_t in_width, cnn_size_t in_height, cnn_size_t window_width, cnn_size_t window_height, cnn_size_t w_stride, cnn_size_t h_stride, padding pad_type) const {
+        return conv_out_length(in_width, window_width, w_stride, pad_type) * conv_out_length(in_height, window_height, h_stride, pad_type);
+    }
+
+    void copy_and_unpad_delta(const vec_t& delta, vec_t& dst) {
+        if (pad_type_ == padding::valid) {
+            dst = delta;
+        }
+        else {
+            for (cnn_size_t c = 0; c < in_.depth_; c++) {
+                float_t *pdst = &dst[in_.get_index(0, 0, c)];
+                const float_t *pin = &delta[in_padded_.get_index(weight_.width_ / 2, weight_.height_ / 2, c)];
+
+                for (cnn_size_t y = 0; y < in_.height_; y++, pdst += in_.width_, pin += in_padded_.width_) {
+                    std::copy(pin, pin + in_.width_, pdst);
+                }
+            }
+        }
+    }
+
+    void copy_and_pad_input(const vec_t& in, int worker_index) {
+        vec_t* dst = prev_out_buf_[worker_index];
+
+        if (pad_type_ == padding::valid) {
+            prev_out_padded_[worker_index] = &in;
+        }
+        else {
+            // make padded version in order to avoid corner-case in fprop/bprop
+            for (cnn_size_t c = 0; c < in_.depth_; c++) {
+                float_t *pimg = &(*dst)[in_padded_.get_index(weight_.width_ / 2, weight_.height_ / 2, c)];
+                const float_t *pin = &in[in_.get_index(0, 0, c)];
+
+                for (cnn_size_t y = 0; y < in_.height_; y++, pin += in_.width_, pimg += in_padded_.width_) {
+                    std::copy(pin, pin + in_.width_, pimg);
+                }
+            }
+            prev_out_padded_[worker_index] = prev_out_buf_[worker_index];
+        }
+    }
+
+    const vec_t* prev_out_padded_[CNN_TASK_SIZE];
+    vec_t* prev_out_buf_[CNN_TASK_SIZE];
+    vec_t  prev_delta_padded_[CNN_TASK_SIZE];
+    vec_t  prev_delta2_padded_;
+
+    connection_table tbl_;
+    index3d<cnn_size_t> in_;
+    index3d<cnn_size_t> in_padded_;
+    index3d<cnn_size_t> out_;
+    index3d<cnn_size_t> weight_;
+    padding pad_type_;
+    size_t w_stride_;
+    size_t h_stride_;
+};
+
+#if 0
+
+#include "tiny_cnn/layers/partial_connected_layer.h"
+
+template<typename Activation = activation::identity>
+class convolutional_layer : public partial_connected_layer<Activation> {
+public:
+    typedef partial_connected_layer<Activation> Base;
+    CNN_USE_LAYER_MEMBERS;
+
+    /**
+     * constructing convolutional layer
+     *
+     * @param in_width     [in] input image width
+     * @param in_height    [in] input image height
+     * @param window_size  [in] window(kernel) size of convolution
+     * @param in_channels  [in] input image channels (grayscale=1, rgb=3)
+     * @param out_channels [in] output image channels
+     * @param padding      [in] rounding strategy
+     *                          valid: use valid pixels of input only. output-size = (in-width - window_size + 1) * (in-height - window_size + 1) * out_channels
+     *                          same: add zero-padding to keep same width/height. output-size = in-width * in-height * out_channels
+     **/
+    convolutional_layer_old(cnn_size_t in_width,
+                        cnn_size_t in_height,
+                        cnn_size_t window_size,
+                        cnn_size_t in_channels,
+                        cnn_size_t out_channels,
+                        padding pad_type = padding::valid)
+    : Base(in_width * in_height * in_channels, out_size(in_width, in_height, window_size, pad_type) * out_channels, 
+           sqr(window_size) * in_channels * out_channels, out_channels), 
+      in_(in_width, in_height, in_channels), 
+      out_(out_length(in_width, window_size, pad_type), out_length(in_height, window_size, pad_type), out_channels),
+      weight_(window_size, window_size, in_channels*out_channels),
+      window_size_(window_size)
+    {
+        init_connection(connection_table(), pad_type);
+    }
+
+    /**
+     * constructing convolutional layer
+     *
+     * @param in_width         [in] input image width
+     * @param in_height        [in] input image height
+     * @param window_size      [in] window(kernel) size of convolution
+     * @param in_channels      [in] input image channels (grayscale=1, rgb=3)
+     * @param out_channels     [in] output image channels
+     * @param connection_table [in] definition of connections between in-channels and out-channels
+     * @param pad_type         [in] rounding strategy 
+     *                               valid: use valid pixels of input only. output-size = (in-width - window_size + 1) * (in-height - window_size + 1) * out_channels
+     *                               same: add zero-padding to keep same width/height. output-size = in-width * in-height * out_channels
+     **/
+    convolutional_layer_old(cnn_size_t in_width,
+                        cnn_size_t in_height,
+                        cnn_size_t window_size,
+                        cnn_size_t in_channels,
+                        cnn_size_t out_channels,
+                        const connection_table& connection_table,
+                        padding pad_type = padding::valid)
+        : Base(in_width * in_height * in_channels, out_size(in_width, in_height, window_size, pad_type) * out_channels, 
+               sqr(window_size) * in_channels * out_channels, out_channels), 
+          in_(in_width, in_height, in_channels), 
+          out_(out_length(in_width, window_size, pad_type), out_length(in_height, window_size, pad_type), out_channels),
+          weight_(window_size, window_size, in_channels*out_channels),
+          connection_(connection_table),
+          window_size_(window_size)
+    {
+        init_connection(connection_table, pad_type);
+        //this->remap();
+    }
+
+    image<> output_to_image(size_t worker_index = 0) const {
+        return vec2image<unsigned char>(output_[worker_index], out_);
+    }
+
+    image<> weight_to_image() const {
+        image<> img;
+        const cnn_size_t border_width = 1;
+        const auto pitch = window_size_ + border_width;
+        const auto width = out_.depth_ * pitch + border_width;
+        const auto height = in_.depth_ * pitch + border_width;
+        const image<>::intensity_t bg_color = 255;
+
+        img.resize(width, height);
+        img.fill(bg_color);
+
+        auto minmax = std::minmax_element(this->W_.begin(), this->W_.end());
+
+        for (cnn_size_t r = 0; r < in_.depth_; ++r) {
+            for (cnn_size_t c = 0; c < out_.depth_; ++c) {
+                if (!connection_.is_connected(c, r)) continue;
+
+                const auto top = r * pitch + border_width;
+                const auto left = c * pitch + border_width;
+
+                for (cnn_size_t y = 0; y < window_size_; ++y) {
+                    for (cnn_size_t x = 0; x < window_size_; ++x) {
+                        const float_t w = W_[weight_.get_index(x, y, c * in_.depth_ + r)];
+
+                        img.at(left + x, top + y)
+                            = static_cast<image<>::intensity_t>(rescale(w, *minmax.first, *minmax.second, 0, 255));
+                    }
+                }
+            }
+        }
+        return img;
+    }
+
+    index3d<cnn_size_t> in_shape() const override { return in_; }
+    index3d<cnn_size_t> out_shape() const override { return out_; }
+    std::string layer_type() const override { return "conv"; }
+
+private:
+    cnn_size_t out_length(cnn_size_t in_length, cnn_size_t window_size, padding pad_type) const {
+        return pad_type == padding::same ? in_length : (in_length - window_size + 1);
+    }
+
+    cnn_size_t out_size(cnn_size_t in_width, cnn_size_t in_height, cnn_size_t window_size, padding pad_type) const {
+        return out_length(in_width, window_size, pad_type) * out_length(in_height, window_size, pad_type);
+    }
+
+    void init_connection(const connection_table& table, padding pad_type) {
+        cnn_size_t pad = (pad_type == padding::valid) ? 0 : window_size_ / 2;
+
+        for (cnn_size_t inc = 0; inc < in_.depth_; ++inc) {
+            for (cnn_size_t outc = 0; outc < out_.depth_; ++outc) {
+                if (!table.is_connected(outc, inc)) {
+                    continue;
+                }
+
+                for (cnn_size_t y = 0; y < out_.height_; ++y)
+                    for (cnn_size_t x = 0; x < out_.width_; ++x)
+                        connect_kernel(inc, outc, x, y, pad);
+            }
+        }
+
+        for (cnn_size_t outc = 0; outc < out_.depth_; ++outc)
+            for (cnn_size_t y = 0; y < out_.height_; ++y)
+                for (cnn_size_t x = 0; x < out_.width_; ++x)
+                    this->connect_bias(outc, out_.get_index(x, y, outc));
+    }
+
+    void connect_kernel(cnn_size_t inc, cnn_size_t outc, cnn_size_t x, cnn_size_t y, cnn_size_t pad) {
+
+        for (cnn_size_t dy = 0; dy < window_size_; ++dy) {
+            if (y + dy < pad) continue;
+            if (y + dy - pad >= in_.height_) continue;
+
+            for (cnn_size_t dx = 0; dx < window_size_; ++dx) {
+                if (x + dx < pad) continue;
+                if (x + dx - pad >= in_.width_) continue;
+
+                this->connect_weight(
+                    in_.get_index(x + dx - pad, y + dy - pad, inc), 
+                    out_.get_index(x, y, outc), 
+                    weight_.get_index(dx, dy, outc * in_.depth_ + inc));
+            }
+        }
+    }
+
+    index3d<cnn_size_t> in_;
+    index3d<cnn_size_t> out_;
+    index3d<cnn_size_t> weight_;
+    connection_table connection_;
+    size_t window_size_;
+};
+
+#endif
+
+} // namespace tiny_cnn
