@@ -51,7 +51,6 @@ object MainApp extends IOApp.Simple {
     image
   }
 
- 
   private def printImagePreview(image: Array[Float], width: Int = 28, height: Int = 28): Unit = {
     println("Input image preview (28x28):")
     for (h <- 0 until height) {
