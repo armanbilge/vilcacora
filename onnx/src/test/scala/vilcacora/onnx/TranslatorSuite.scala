@@ -218,6 +218,51 @@ class TranslatorSuite extends FunSuite {
 
     assertEquals(Translator.translateNode(node), Right(expected))
   }
+  test("translateNode should translate a Softmax node with default axis") {
+    val node = NodeProto(
+      opType = "Softmax",
+      input = Seq("input_tensor"),
+      output = Seq("output_tensor"),
+      // No axis attribute, should default to -1
+    )
+
+    assertEquals(
+      Translator.translateNode(node),
+      Right(Operation.Softmax("input_tensor", "output_tensor", axis = -1)),
+    )
+  }
+
+  test("translateNode should translate a Softmax node with explicit axis") {
+    val node = NodeProto(
+      opType = "Softmax",
+      input = Seq("logits"),
+      output = Seq("probabilities"),
+      attribute = Seq(
+        AttributeProto(name = "axis", i = 1L, `type` = AttributeProto.AttributeType.INT),
+      ),
+    )
+
+    assertEquals(
+      Translator.translateNode(node),
+      Right(Operation.Softmax("logits", "probabilities", axis = 1)),
+    )
+  }
+
+  test("translateNode should handle Softmax with axis=0") {
+    val node = NodeProto(
+      opType = "Softmax",
+      input = Seq("batch_logits"),
+      output = Seq("batch_probs"),
+      attribute = Seq(
+        AttributeProto(name = "axis", i = 0L, `type` = AttributeProto.AttributeType.INT),
+      ),
+    )
+
+    assertEquals(
+      Translator.translateNode(node),
+      Right(Operation.Softmax("batch_logits", "batch_probs", axis = 0)),
+    )
+  }
 
   // --- End-to-end tests using model files from resources ---
 

@@ -284,6 +284,54 @@ class InterpreterSuite extends FunSuite {
     assertEquals(output.toSeq, expected.toSeq)
   }
 
+  /** Test Identity Conv (1×1 kernel) should return input unchanged */
+  test("Identity convolution should produce identical output for 1×1 kernel") {
+    // Input: 1 batch, 1 channel, 3×3 image
+    val input = Array(
+      1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f,
+    )
+
+    // Weights: 1 output channel, 1 input channel, 1×1 kernel with weight=1
+    val weight = Array(1.0f)
+
+    // No bias
+    val model = ModelIR(
+      name = "identity_conv_test",
+      operations = List(
+        Operation.Conv(
+          input = "input",
+          weight = "weight",
+          bias = None,
+          output = "output",
+          autoPad = AutoPad.NotSet, // VALID
+          dilations = List(1, 1),
+          group = 1,
+          kernelShape = List(1, 1),
+          pads = List(0, 0, 0, 0),
+          strides = List(1, 1),
+        ),
+      ),
+      allocations = Map(
+        "input" -> Allocation("input", DataType.Float32, List(1, 1, 3, 3)),
+        "weight" -> Allocation("weight", DataType.Float32, List(1, 1, 1, 1)),
+        "output" -> Allocation("output", DataType.Float32, List(1, 1, 3, 3)),
+      ),
+      graphInputs = List("input", "weight"),
+      graphOutputs = List("output"),
+    )
+
+    val inputs = Map(
+      "input" -> input,
+      "weight" -> weight,
+    )
+
+    val results = Interpreter.execute(model, inputs).use(_.map(identity)).unsafeRunSync()
+    val output = results("output").asInstanceOf[Array[Float]]
+    val expected = input
+
+    assertEquals(output.toSeq, expected.toSeq)
+  }
+
   /** Test MaxPool operation */
   test("MaxPool operation should find the max value in each window") {
     // Input: 1 batch, 1 channel, 4x4 image

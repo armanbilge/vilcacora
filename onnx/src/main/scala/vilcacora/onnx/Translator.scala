@@ -352,7 +352,16 @@ object Translator {
           dataType = dataType,
           shape = shape,
         )
-
+      case "Softmax" =>
+        for {
+          _ <- checkArity(node, expectedInputs = 1, expectedOutputs = 1)
+          // The 'axis' attribute is optional and defaults to -1 in ONNX version 13+
+          axis = node.attribute.find(_.name == "axis").map(_.i).getOrElse(-1L)
+        } yield Operation.Softmax(
+          input = node.input.head,
+          output = node.output.head,
+          axis = axis.toInt,
+        )
       case unsupported => Left(s"Unsupported operation type: $unsupported")
     }
   }

@@ -250,6 +250,18 @@ object Operation {
     override def inputs: List[String] = List(input, shape)
     override def outputs: List[String] = List(output)
   }
+
+  /** Represents a Softmax activation operation.
+    */
+  final case class Softmax(
+      input: String,
+      output: String,
+      // --- Attributes ---
+      axis: Int = -1, // Default axis is -1 (last dimension)
+  ) extends Operation {
+    override def inputs: List[String] = List(input)
+    override def outputs: List[String] = List(output)
+  }
   // Add more operations here...
 }
 

@@ -25,7 +25,7 @@ import scala.scalanative.libc.stdlib
 import scala.scalanative.libc.string.memcpy
 import scala.scalanative.unsigned._
 import scala.collection.mutable.ListBuffer
-import com.armanbilge.vilcacora.runtime.TinyCNN._
+
 import com.armanbilge.vilcacora.runtime.BLAS._
 import com.armanbilge.vilcacora.runtime.BLASConstants._
 
@@ -76,8 +76,8 @@ object Interpreter {
     */
   private def validateModel(model: ModelIR): Unit =
     model.operations.foreach {
-      case _: Operation.SVMClassifier | _: Operation.Mul | _: Operation.Conv |
-          _: Operation.MaxPool =>
+      case _: Operation.SVMClassifier | _: Operation.Mul |
+          _: Operation.Softmax => // softmax currently here only because axis is ignored
         () // Supported
       case op: Operation.Add =>
         // Validate Add operation broadcasting compatibility
@@ -181,6 +181,57 @@ object Interpreter {
               s"MatMul operation not implemented for data type: $unsupported",
             )
         }
+      case op: Operation.Conv =>
+        // Validate Conv operation for MLPack compatibility
+        val inputAlloc = model.allocations(op.input)
+
+        // MLPack only supports Float32 tensors (converted to Float64 internally)
+        inputAlloc.dataType match {
+          case DataType.Float32 | DataType.Float64 => () // Supported
+          case unsupported =>
+            throw new NotImplementedError(
+              s"Conv operation with MLPack only supports Float32 or Float64, got: $unsupported",
+            )
+        }
+
+        // MLPack convolution limitations
+        val padsAreZero = op.pads.forall(_ == 0)
+        val autoPadOk = op.autoPad match {
+          case AutoPad.SameUpper | AutoPad.Valid => true
+          case AutoPad.NotSet if padsAreZero => true // treat as VALID
+          case _ => false
+        }
+        require(
+          autoPadOk,
+          s"MLPack Conv supports SAME_UPPER, VALID, or NOTSET with zero pads; " +
+            s"got autoPad=${op.autoPad}, pads=${op.pads}",
+        )
+
+        require(
+          op.group == 1,
+          s"MLPack Conv does not support grouping (group=${op.group}), only group=1",
+        )
+
+        require(
+          op.dilations.forall(_ == 1),
+          s"MLPack Conv does not support dilation (dilations=${op.dilations}), only [1,1]",
+        )
+
+      case op: Operation.MaxPool =>
+        // Validate MaxPool operation for MLPack compatibility
+        val inputAlloc = model.allocations(op.input)
+
+        inputAlloc.dataType match {
+          case DataType.Float32 | DataType.Float64 => () // Supported
+          case unsupported =>
+            throw new NotImplementedError(
+              s"MaxPool operation with MLPack only supports Float32 or Float64, got: $unsupported",
+            )
+        }
+
+        // MLPack does not implement dilation or ceil_mode
+        require(op.dilations.forall(_ == 1), "MLPack MaxPool requires dilations = [1,1]")
+        require(!op.ceilMode, "MLPack MaxPool does not support ceil_mode = true")
       case other =>
         throw new NotImplementedError(s"Operation not implemented: ${other.getClass.getSimpleName}")
     }
@@ -243,6 +294,8 @@ object Interpreter {
       case op: Operation.Conv => Resource.pure(handleConv(op, memory, model))
       case op: Operation.MaxPool => Resource.pure(handleMaxPool(op, memory, model))
       case op: Operation.MatMul => Resource.pure(handleMatMul(op, memory, model))
+      case op: Operation.Softmax => Resource.pure(handleSoftmax(op, memory, model))
+
       case other =>
         // This case is unreachable due to the pre-validation step.
         // It remains as a safeguard against internal logic errors.
@@ -665,103 +718,250 @@ object Interpreter {
     }
   }
 
-  /** Handles Convolution operation using tiny-cnn */
   private def handleConv(op: Operation.Conv, memory: MemoryMap, model: ModelIR): IO[Unit] = IO {
-    val inputShape = model.allocations(op.input).shape
-    val weightShape = model.allocations(op.weight).shape
+    val inputAlloc = model.allocations(op.input)
+    val weightAlloc = model.allocations(op.weight)
 
-    val inputPtr = memory(op.input).asInstanceOf[Ptr[CFloat]]
-    val weightPtr = memory(op.weight).asInstanceOf[Ptr[CFloat]]
-    val outputPtr = memory(op.output).asInstanceOf[Ptr[CFloat]]
+    val inputShape = inputAlloc.shape
+    val weightShape = weightAlloc.shape
+    val (inputChannels, inputHeight, inputWidth) = (inputShape(1), inputShape(2), inputShape(3))
+    val (outputChannels, kernelHeight, kernelWidth) =
+      (weightShape(0), op.kernelShape(0), op.kernelShape(1))
 
-    val outputChannels = weightShape(0)
+    val inputPtr = memory(op.input)
+    val weightPtr = memory(op.weight)
+    val outputPtr = memory(op.outputs.head)
 
-    // Track if zero bias was allocated
-    var zeroBiasPtr: Ptr[CFloat] = null
-    var zeroBiasAllocated = false
-
-    val biasPtr = op.bias match {
-      case Some(biasName) =>
-        memory(biasName).asInstanceOf[Ptr[CFloat]]
-
-      case None =>
-        zeroBiasAllocated = true
-        zeroBiasPtr =
-          stdlib.malloc(sizeof[CFloat] * outputChannels.toUSize).asInstanceOf[Ptr[CFloat]]
-        if (zeroBiasPtr == null)
-          throw new OutOfMemoryError(s"Failed to allocate zero bias for $outputChannels channels")
-        for (i <- 0 until outputChannels)
-          !(zeroBiasPtr + i) = 0.0f
-        zeroBiasPtr
+    // AutoPad value resolution
+    val autoPadValue = op.autoPad match {
+      case AutoPad.SameUpper => 1
+      case AutoPad.Valid => 0
+      case AutoPad.NotSet if op.pads.forall(_ == 0) => 0
+      case other => throw new IllegalArgumentException(s"Unsupported autoPad in handleConv: $other")
     }
 
-    val padH = if (op.autoPad == AutoPad.SameUpper || op.autoPad == AutoPad.SameLower) {
-      (op.kernelShape(0) - 1) / 2
-    } else {
-      op.pads.headOption.getOrElse(0)
-    }
-
-    val padW = if (op.autoPad == AutoPad.SameUpper || op.autoPad == AutoPad.SameLower) {
-      (op.kernelShape(1) - 1) / 2
-    } else {
-      op.pads.drop(1).headOption.getOrElse(0)
-    }
-
-    val result = conv2d_single_inference(
-      input_data = inputPtr,
-      weights = weightPtr,
-      bias = biasPtr,
-      output = outputPtr,
-      input_height = inputShape(2).asInstanceOf[CInt],
-      input_width = inputShape(3).asInstanceOf[CInt],
-      input_channels = inputShape(1).asInstanceOf[CInt],
-      kernel_height = op.kernelShape(0).asInstanceOf[CInt],
-      kernel_width = op.kernelShape(1).asInstanceOf[CInt],
-      output_channels = weightShape(0).asInstanceOf[CInt],
-      stride_h = op.strides(0).asInstanceOf[CInt],
-      stride_w = op.strides(1).asInstanceOf[CInt],
-      pad_h = padH.asInstanceOf[CInt],
-      pad_w = padW.asInstanceOf[CInt],
-    )
-
-    // Free the zero bias if we allocated it
-    if (zeroBiasAllocated) {
-      stdlib.free(zeroBiasPtr.asInstanceOf[Ptr[Byte]])
-    }
-
-    if (result != 0) {
-      throw new RuntimeException(s"Convolution operation failed with error code: $result")
-    }
-  }
-
-  /** Handles MaxPool operation using tiny-cnn single inference */
-  private def handleMaxPool(op: Operation.MaxPool, memory: MemoryMap, model: ModelIR): IO[Unit] =
-    IO {
-      val inputShape = model.allocations(op.input).shape // [1, C, H, W] - batch size always 1
-
-      val inputPtr = memory(op.input).asInstanceOf[Ptr[CFloat]]
-      val outputPtr = memory(op.output).asInstanceOf[Ptr[CFloat]]
-
-      // Single object processing - no batch dimension handling
-      val result = maxpool2d_single_inference(
-        input_data = inputPtr,
-        output = outputPtr,
-        // Input dimensions (single sample - shape[0] ignored, always 1)
-        input_height = inputShape(2).asInstanceOf[CInt],
-        input_width = inputShape(3).asInstanceOf[CInt],
-        channels = inputShape(1).asInstanceOf[CInt],
-        // Pooling parameters
-        kernel_height = op.kernelShape(0).asInstanceOf[CInt],
-        kernel_width = op.kernelShape(1).asInstanceOf[CInt],
-        stride_h = op.strides(0).asInstanceOf[CInt],
-        stride_w = op.strides(1).asInstanceOf[CInt],
-        pad_h = 0.asInstanceOf[CInt], // MaxPool typically doesn't use padding
-        pad_w = 0.asInstanceOf[CInt],
+    // Common convolution parameters
+    var convParams: Ptr[MLPack.ConvolutionParameters] = null
+    try {
+      convParams = MLPack.create_convolution_parameters(
+        outputChannels.toUSize,
+        kernelHeight.toUSize,
+        kernelWidth.toUSize,
+        op.strides(0).toUSize,
+        op.strides(1).toUSize,
+        autoPadValue,
       )
 
-      if (result != 0) {
-        throw new RuntimeException(s"MaxPool operation failed with error code: $result")
+      inputAlloc.dataType match {
+        case DataType.Float32 =>
+          var colMajorInput: Ptr[CFloat] = null
+          var mlpackWeights: Ptr[CFloat] = null
+          var result: Ptr[MLPack.FOpResult] = null
+          var rowMajorOutput: Ptr[CFloat] = null
+
+          try {
+            val biasPtrOpt = op.bias.map(b => memory(b).asInstanceOf[Ptr[CFloat]])
+            val useBias = if (biasPtrOpt.isDefined) 1 else 0
+
+            colMajorInput = MLPack.F_convert_row_to_column_major(
+              inputPtr.asInstanceOf[Ptr[CFloat]],
+              inputHeight.toUSize,
+              inputWidth.toUSize,
+              inputChannels.toUSize,
+            )
+            mlpackWeights = MLPack.F_convert_oihw_to_mlpack_format(
+              weightPtr.asInstanceOf[Ptr[CFloat]],
+              outputChannels.toUSize,
+              inputChannels.toUSize,
+              kernelHeight.toUSize,
+              kernelWidth.toUSize,
+            )
+
+            result = MLPack.F_perform_convolution(
+              convParams,
+              colMajorInput,
+              inputHeight.toUSize,
+              inputWidth.toUSize,
+              inputChannels.toUSize,
+              mlpackWeights,
+              biasPtrOpt.getOrElse(null),
+              useBias,
+            )
+
+            rowMajorOutput =
+              MLPack.F_convert_column_to_row_major(result._1, result._2, result._3, result._4)
+            val totalElements = (result._2 * result._3 * result._4).toLong
+
+            memcpy(
+              outputPtr,
+              rowMajorOutput.asInstanceOf[Ptr[Byte]],
+              totalElements.toUSize * sizeof[CFloat],
+            )
+            ()
+          } finally {
+            if (colMajorInput != null) MLPack.F_free_converted_memory(colMajorInput)
+            if (mlpackWeights != null) MLPack.F_free_converted_memory(mlpackWeights)
+            if (result != null) MLPack.free_Fop_result(result)
+            if (rowMajorOutput != null) MLPack.F_free_converted_memory(rowMajorOutput)
+          }
+
+        case DataType.Float64 =>
+          var colMajorInput: Ptr[CDouble] = null
+          var mlpackWeights: Ptr[CDouble] = null
+          var result: Ptr[MLPack.OpResult] = null
+          var rowMajorOutput: Ptr[CDouble] = null
+
+          try {
+            val biasPtrOpt = op.bias.map(b => memory(b).asInstanceOf[Ptr[CDouble]])
+            val useBias = if (biasPtrOpt.isDefined) 1 else 0
+
+            colMajorInput = MLPack.convert_row_to_column_major(
+              inputPtr.asInstanceOf[Ptr[CDouble]],
+              inputHeight.toUSize,
+              inputWidth.toUSize,
+              inputChannels.toUSize,
+            )
+            mlpackWeights = MLPack.convert_oihw_to_mlpack_format(
+              weightPtr.asInstanceOf[Ptr[CDouble]],
+              outputChannels.toUSize,
+              inputChannels.toUSize,
+              kernelHeight.toUSize,
+              kernelWidth.toUSize,
+            )
+
+            result = MLPack.perform_convolution(
+              convParams,
+              colMajorInput,
+              inputHeight.toUSize,
+              inputWidth.toUSize,
+              inputChannels.toUSize,
+              mlpackWeights,
+              biasPtrOpt.getOrElse(null),
+              useBias,
+            )
+
+            rowMajorOutput =
+              MLPack.convert_column_to_row_major(result._1, result._2, result._3, result._4)
+            val totalElements = (result._2 * result._3 * result._4).toLong
+
+            memcpy(
+              outputPtr,
+              rowMajorOutput.asInstanceOf[Ptr[Byte]],
+              totalElements.toUSize * sizeof[CDouble],
+            )
+            ()
+          } finally {
+            if (colMajorInput != null) MLPack.free_converted_memory(colMajorInput)
+            if (mlpackWeights != null) MLPack.free_converted_memory(mlpackWeights)
+            if (result != null) MLPack.free_op_result(result)
+            if (rowMajorOutput != null) MLPack.free_converted_memory(rowMajorOutput)
+          }
+
+        case other => throw new NotImplementedError(s"Conv input data type $other not supported.")
       }
+    } finally
+      if (convParams != null) MLPack.free_convolution_parameters(convParams)
+  }
+
+  private def handleMaxPool(op: Operation.MaxPool, memory: MemoryMap, model: ModelIR): IO[Unit] =
+    IO {
+      val inputAlloc = model.allocations(op.input)
+
+      val inputShape = inputAlloc.shape
+
+      val (inputChannels, inputHeight, inputWidth) = (inputShape(1), inputShape(2), inputShape(3))
+      val (kernelHeight, kernelWidth) = (op.kernelShape(0), op.kernelShape(1))
+
+      val inputPtr = memory(op.input)
+      val outputPtr = memory(op.outputs.head)
+
+      var poolParams: Ptr[MLPack.MaxPoolingParameters] = null
+      try {
+        poolParams = MLPack.create_maxpooling_parameters(
+          kernelHeight.toUSize,
+          kernelWidth.toUSize,
+          op.strides(0).toUSize,
+          op.strides(1).toUSize,
+        )
+
+        inputAlloc.dataType match {
+          case DataType.Float32 =>
+            var colMajorInput: Ptr[CFloat] = null
+            var result: Ptr[MLPack.FOpResult] = null
+            var rowMajorOutput: Ptr[CFloat] = null
+
+            try {
+              colMajorInput = MLPack.F_convert_row_to_column_major(
+                inputPtr.asInstanceOf[Ptr[CFloat]],
+                inputHeight.toUSize,
+                inputWidth.toUSize,
+                inputChannels.toUSize,
+              )
+              result = MLPack.F_perform_maxpooling(
+                poolParams,
+                colMajorInput,
+                inputHeight.toUSize,
+                inputWidth.toUSize,
+                inputChannels.toUSize,
+              )
+
+              rowMajorOutput =
+                MLPack.F_convert_column_to_row_major(result._1, result._2, result._3, result._4)
+              val totalElements = (result._2 * result._3 * result._4).toLong
+
+              memcpy(
+                outputPtr,
+                rowMajorOutput.asInstanceOf[Ptr[Byte]],
+                totalElements.toUSize * sizeof[CFloat],
+              )
+              ()
+            } finally {
+              if (colMajorInput != null) MLPack.F_free_converted_memory(colMajorInput)
+              if (result != null) MLPack.free_Fop_result(result)
+              if (rowMajorOutput != null) MLPack.F_free_converted_memory(rowMajorOutput)
+            }
+
+          case DataType.Float64 =>
+            var colMajorInput: Ptr[CDouble] = null
+            var result: Ptr[MLPack.OpResult] = null
+            var rowMajorOutput: Ptr[CDouble] = null
+
+            try {
+              colMajorInput = MLPack.convert_row_to_column_major(
+                inputPtr.asInstanceOf[Ptr[CDouble]],
+                inputHeight.toUSize,
+                inputWidth.toUSize,
+                inputChannels.toUSize,
+              )
+              result = MLPack.perform_maxpooling(
+                poolParams,
+                colMajorInput,
+                inputHeight.toUSize,
+                inputWidth.toUSize,
+                inputChannels.toUSize,
+              )
+
+              rowMajorOutput =
+                MLPack.convert_column_to_row_major(result._1, result._2, result._3, result._4)
+              val totalElements = (result._2 * result._3 * result._4).toLong
+
+              memcpy(
+                outputPtr,
+                rowMajorOutput.asInstanceOf[Ptr[Byte]],
+                totalElements.toUSize * sizeof[CDouble],
+              )
+              ()
+            } finally {
+              if (colMajorInput != null) MLPack.free_converted_memory(colMajorInput)
+              if (result != null) MLPack.free_op_result(result)
+              if (rowMajorOutput != null) MLPack.free_converted_memory(rowMajorOutput)
+            }
+
+          case other =>
+            throw new NotImplementedError(s"MaxPool input data type $other not supported.")
+        }
+      } finally
+        if (poolParams != null) MLPack.free_maxpooling_parameters(poolParams)
     }
 
   /** Handles Matrix Multiplication using OpenBLAS CBLAS functions. Performs C = A * B where A is
@@ -824,6 +1024,78 @@ object Interpreter {
         throw new IllegalStateException(s"Unvalidated MatMul data type: $unsupported")
     }
   }
+  private def handleSoftmax(op: Operation.Softmax, memory: MemoryMap, model: ModelIR): IO[Unit] =
+    IO {
+      val inputAlloc = model.allocations(op.input)
+      val inputShape = inputAlloc.shape
+
+      val (inputChannels, inputHeight, inputWidth) = inputShape.length match {
+        case 1 => (1, 1, inputShape(0)) // 1D: treat as width, softmax across this dimension
+        case 2 => (1, inputShape(0), inputShape(1)) // 2D: height x width, softmax across width
+        case 3 =>
+          (
+            inputShape(0),
+            inputShape(1),
+            inputShape(2),
+          ) // 3D: channels x height x width, softmax across width
+        case 4 =>
+          (
+            inputShape(1),
+            inputShape(2),
+            inputShape(3),
+          ) // 4D: batch x channels x height x width, softmax across width
+        case _ =>
+          throw new IllegalArgumentException(s"Unsupported input shape for Softmax: ${inputShape}")
+      }
+
+      val inputPtr = memory(op.input)
+      val outputPtr = memory(op.output)
+
+      inputAlloc.dataType match {
+        case DataType.Float32 =>
+          var result: Ptr[MLPack.FOpResult] = null
+          try {
+            result = MLPack.F_perform_softmax(
+              inputPtr.asInstanceOf[Ptr[CFloat]],
+              inputHeight.toUSize,
+              inputWidth.toUSize,
+              inputChannels.toUSize,
+            )
+
+            val totalElements = (result._2 * result._3 * result._4).toLong
+            memcpy(
+              outputPtr,
+              result._1.asInstanceOf[Ptr[Byte]],
+              totalElements.toUSize * sizeof[CFloat],
+            )
+            ()
+          } finally
+            if (result != null) MLPack.free_Fop_result(result)
+
+        case DataType.Float64 =>
+          var result: Ptr[MLPack.OpResult] = null
+          try {
+            result = MLPack.perform_softmax(
+              inputPtr.asInstanceOf[Ptr[CDouble]],
+              inputHeight.toUSize,
+              inputWidth.toUSize,
+              inputChannels.toUSize,
+            )
+
+            val totalElements = (result._2 * result._3 * result._4).toLong
+            memcpy(
+              outputPtr,
+              result._1.asInstanceOf[Ptr[Byte]],
+              totalElements.toUSize * sizeof[CDouble],
+            )
+            ()
+          } finally
+            if (result != null) MLPack.free_op_result(result)
+
+        case other =>
+          throw new NotImplementedError(s"Softmax input data type $other not supported.")
+      }
+    }
 
   /** Calculate row-major strides for a given shape */
   private def calculateStrides(shape: List[Int]): List[Int] = {
