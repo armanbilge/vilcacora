@@ -58,6 +58,7 @@ lazy val onnx = project
       }
     },
     scalacOptions += "-Wconf:src=src_managed/.*:i",
+    Test / testOptions += Tests.Argument("+l"), // for munit logging
   )
   .dependsOn(ir)
 
@@ -72,4 +73,5 @@ lazy val runtime = project
       "org.scalameta" %%% "munit" % MunitVersion % Test,
     ),
     nativeBrewFormulas ++= Set("openblas", "mlpack"),
+    Test / testOptions += Tests.Argument("+l"), // for munit logging
   )
