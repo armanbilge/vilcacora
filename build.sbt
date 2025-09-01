@@ -17,6 +17,8 @@ ThisBuild / githubWorkflowBuildPreamble +=
   WorkflowStep.Run(List("/home/linuxbrew/.linuxbrew/bin/brew update"), name = Some("brew update"))
 ThisBuild / githubWorkflowBuildPreamble ++= nativeBrewInstallWorkflowSteps.value
 
+ThisBuild / Test / testOptions += Tests.Argument("+l") // for munit logging
+
 val CatsEffectVersion = "3.7-8f2b497"
 val CatsVersion = "2.12.0"
 val MunitVersion = "1.0.4"
