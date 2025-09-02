@@ -731,8 +731,8 @@ object Interpreter {
     val inputPtr = memory(op.input)
     val weightPtr = memory(op.weight)
     val outputPtr = memory(op.outputs.head)
+    val biasPtrOpt = op.bias.map(b => memory(b))
 
-    // AutoPad value resolution
     val autoPadValue = op.autoPad match {
       case AutoPad.SameUpper => 1
       case AutoPad.Valid => 0
@@ -740,133 +740,67 @@ object Interpreter {
       case other => throw new IllegalArgumentException(s"Unsupported autoPad in handleConv: $other")
     }
 
-    // Common convolution parameters
-    var convParams: Ptr[MLPack.ConvolutionParameters] = null
-    try {
-      convParams = MLPack.create_convolution_parameters(
-        outputChannels.toUSize,
-        kernelHeight.toUSize,
-        kernelWidth.toUSize,
-        op.strides(0).toUSize,
-        op.strides(1).toUSize,
-        autoPadValue,
-      )
+    val useBias = if (biasPtrOpt.isDefined) 1 else 0
 
-      inputAlloc.dataType match {
-        case DataType.Float32 =>
-          var colMajorInput: Ptr[CFloat] = null
-          var mlpackWeights: Ptr[CFloat] = null
-          var result: Ptr[MLPack.FOpResult] = null
-          var rowMajorOutput: Ptr[CFloat] = null
+    // Pointers to store the output dimensions, allocated on the stack
+    val outputHeightPtr = stackalloc[CSize]()
+    val outputWidthPtr = stackalloc[CSize]()
+    val outputChannelsPtr = stackalloc[CSize]()
 
-          try {
-            val biasPtrOpt = op.bias.map(b => memory(b).asInstanceOf[Ptr[CFloat]])
-            val useBias = if (biasPtrOpt.isDefined) 1 else 0
+    inputAlloc.dataType match {
+      case DataType.Float32 =>
+        MLPack.F_perform_convolution_direct(
+          outputChannels.toUSize,
+          kernelHeight.toUSize,
+          kernelWidth.toUSize,
+          op.strides(0).toUSize,
+          op.strides(1).toUSize,
+          autoPadValue,
+          useBias,
+          inputPtr.asInstanceOf[Ptr[CFloat]],
+          inputHeight.toUSize,
+          inputWidth.toUSize,
+          inputChannels.toUSize,
+          weightPtr.asInstanceOf[Ptr[CFloat]],
+          biasPtrOpt.getOrElse(null).asInstanceOf[Ptr[CFloat]],
+          outputPtr.asInstanceOf[Ptr[CFloat]],
+          outputHeightPtr,
+          outputWidthPtr,
+          outputChannelsPtr,
+        )
 
-            colMajorInput = MLPack.F_convert_row_to_column_major(
-              inputPtr.asInstanceOf[Ptr[CFloat]],
-              inputHeight.toUSize,
-              inputWidth.toUSize,
-              inputChannels.toUSize,
-            )
-            mlpackWeights = MLPack.F_convert_oihw_to_mlpack_format(
-              weightPtr.asInstanceOf[Ptr[CFloat]],
-              outputChannels.toUSize,
-              inputChannels.toUSize,
-              kernelHeight.toUSize,
-              kernelWidth.toUSize,
-            )
+      case DataType.Float64 =>
+        // For Double, we assume CSize and Int are interchangeable for dimensions.
+        val outputHeightPtr = stackalloc[CSize]()
+        val outputWidthPtr = stackalloc[CSize]()
+        val outputChannelsPtr = stackalloc[CSize]()
 
-            result = MLPack.F_perform_convolution(
-              convParams,
-              colMajorInput,
-              inputHeight.toUSize,
-              inputWidth.toUSize,
-              inputChannels.toUSize,
-              mlpackWeights,
-              biasPtrOpt.getOrElse(null),
-              useBias,
-            )
-
-            rowMajorOutput =
-              MLPack.F_convert_column_to_row_major(result._1, result._2, result._3, result._4)
-            val totalElements = (result._2 * result._3 * result._4).toLong
-
-            memcpy(
-              outputPtr,
-              rowMajorOutput.asInstanceOf[Ptr[Byte]],
-              totalElements.toUSize * sizeof[CFloat],
-            )
-            ()
-          } finally {
-            if (colMajorInput != null) MLPack.F_free_converted_memory(colMajorInput)
-            if (mlpackWeights != null) MLPack.F_free_converted_memory(mlpackWeights)
-            if (result != null) MLPack.free_Fop_result(result)
-            if (rowMajorOutput != null) MLPack.F_free_converted_memory(rowMajorOutput)
-          }
-
-        case DataType.Float64 =>
-          var colMajorInput: Ptr[CDouble] = null
-          var mlpackWeights: Ptr[CDouble] = null
-          var result: Ptr[MLPack.OpResult] = null
-          var rowMajorOutput: Ptr[CDouble] = null
-
-          try {
-            val biasPtrOpt = op.bias.map(b => memory(b).asInstanceOf[Ptr[CDouble]])
-            val useBias = if (biasPtrOpt.isDefined) 1 else 0
-
-            colMajorInput = MLPack.convert_row_to_column_major(
-              inputPtr.asInstanceOf[Ptr[CDouble]],
-              inputHeight.toUSize,
-              inputWidth.toUSize,
-              inputChannels.toUSize,
-            )
-            mlpackWeights = MLPack.convert_oihw_to_mlpack_format(
-              weightPtr.asInstanceOf[Ptr[CDouble]],
-              outputChannels.toUSize,
-              inputChannels.toUSize,
-              kernelHeight.toUSize,
-              kernelWidth.toUSize,
-            )
-
-            result = MLPack.perform_convolution(
-              convParams,
-              colMajorInput,
-              inputHeight.toUSize,
-              inputWidth.toUSize,
-              inputChannels.toUSize,
-              mlpackWeights,
-              biasPtrOpt.getOrElse(null),
-              useBias,
-            )
-
-            rowMajorOutput =
-              MLPack.convert_column_to_row_major(result._1, result._2, result._3, result._4)
-            val totalElements = (result._2 * result._3 * result._4).toLong
-
-            memcpy(
-              outputPtr,
-              rowMajorOutput.asInstanceOf[Ptr[Byte]],
-              totalElements.toUSize * sizeof[CDouble],
-            )
-            ()
-          } finally {
-            if (colMajorInput != null) MLPack.free_converted_memory(colMajorInput)
-            if (mlpackWeights != null) MLPack.free_converted_memory(mlpackWeights)
-            if (result != null) MLPack.free_op_result(result)
-            if (rowMajorOutput != null) MLPack.free_converted_memory(rowMajorOutput)
-          }
-
-        case other => throw new NotImplementedError(s"Conv input data type $other not supported.")
-      }
-    } finally
-      if (convParams != null) MLPack.free_convolution_parameters(convParams)
+        MLPack.perform_convolution_direct(
+          outputChannels.toUSize,
+          kernelHeight.toUSize,
+          kernelWidth.toUSize,
+          op.strides(0).toUSize,
+          op.strides(1).toUSize,
+          autoPadValue,
+          useBias,
+          inputPtr.asInstanceOf[Ptr[CDouble]],
+          inputHeight.toUSize,
+          inputWidth.toUSize,
+          inputChannels.toUSize,
+          weightPtr.asInstanceOf[Ptr[CDouble]],
+          biasPtrOpt.getOrElse(null).asInstanceOf[Ptr[CDouble]],
+          outputPtr.asInstanceOf[Ptr[CDouble]],
+          outputHeightPtr,
+          outputWidthPtr,
+          outputChannelsPtr,
+        )
+      case other => throw new NotImplementedError(s"Conv input data type $other not supported.")
+    }
   }
 
   private def handleMaxPool(op: Operation.MaxPool, memory: MemoryMap, model: ModelIR): IO[Unit] =
     IO {
       val inputAlloc = model.allocations(op.input)
-
       val inputShape = inputAlloc.shape
 
       val (inputChannels, inputHeight, inputWidth) = (inputShape(1), inputShape(2), inputShape(3))
@@ -875,93 +809,51 @@ object Interpreter {
       val inputPtr = memory(op.input)
       val outputPtr = memory(op.outputs.head)
 
-      var poolParams: Ptr[MLPack.MaxPoolingParameters] = null
-      try {
-        poolParams = MLPack.create_maxpooling_parameters(
-          kernelHeight.toUSize,
-          kernelWidth.toUSize,
-          op.strides(0).toUSize,
-          op.strides(1).toUSize,
-        )
+      // Pointers to store the output dimensions
+      val outputHeightPtr = stackalloc[CSize]()
+      val outputWidthPtr = stackalloc[CSize]()
+      val outputChannelsPtr = stackalloc[CSize]()
 
-        inputAlloc.dataType match {
-          case DataType.Float32 =>
-            var colMajorInput: Ptr[CFloat] = null
-            var result: Ptr[MLPack.FOpResult] = null
-            var rowMajorOutput: Ptr[CFloat] = null
+      inputAlloc.dataType match {
+        case DataType.Float32 =>
+          MLPack.F_perform_maxpooling_direct(
+            kernelHeight.toUSize,
+            kernelWidth.toUSize,
+            op.strides(0).toUSize,
+            op.strides(1).toUSize,
+            inputPtr.asInstanceOf[Ptr[CFloat]],
+            inputHeight.toUSize,
+            inputWidth.toUSize,
+            inputChannels.toUSize,
+            outputPtr.asInstanceOf[Ptr[CFloat]],
+            outputHeightPtr,
+            outputWidthPtr,
+            outputChannelsPtr,
+          )
 
-            try {
-              colMajorInput = MLPack.F_convert_row_to_column_major(
-                inputPtr.asInstanceOf[Ptr[CFloat]],
-                inputHeight.toUSize,
-                inputWidth.toUSize,
-                inputChannels.toUSize,
-              )
-              result = MLPack.F_perform_maxpooling(
-                poolParams,
-                colMajorInput,
-                inputHeight.toUSize,
-                inputWidth.toUSize,
-                inputChannels.toUSize,
-              )
+        case DataType.Float64 =>
+          val outputHeightPtr = stackalloc[CSize]()
+          val outputWidthPtr = stackalloc[CSize]()
+          val outputChannelsPtr = stackalloc[CSize]()
 
-              rowMajorOutput =
-                MLPack.F_convert_column_to_row_major(result._1, result._2, result._3, result._4)
-              val totalElements = (result._2 * result._3 * result._4).toLong
+          MLPack.perform_maxpooling_direct(
+            kernelHeight.toUSize,
+            kernelWidth.toUSize,
+            op.strides(0).toUSize,
+            op.strides(1).toUSize,
+            inputPtr.asInstanceOf[Ptr[CDouble]],
+            inputHeight.toUSize,
+            inputWidth.toUSize,
+            inputChannels.toUSize,
+            outputPtr.asInstanceOf[Ptr[CDouble]],
+            outputHeightPtr,
+            outputWidthPtr,
+            outputChannelsPtr,
+          )
 
-              memcpy(
-                outputPtr,
-                rowMajorOutput.asInstanceOf[Ptr[Byte]],
-                totalElements.toUSize * sizeof[CFloat],
-              )
-              ()
-            } finally {
-              if (colMajorInput != null) MLPack.F_free_converted_memory(colMajorInput)
-              if (result != null) MLPack.free_Fop_result(result)
-              if (rowMajorOutput != null) MLPack.F_free_converted_memory(rowMajorOutput)
-            }
-
-          case DataType.Float64 =>
-            var colMajorInput: Ptr[CDouble] = null
-            var result: Ptr[MLPack.OpResult] = null
-            var rowMajorOutput: Ptr[CDouble] = null
-
-            try {
-              colMajorInput = MLPack.convert_row_to_column_major(
-                inputPtr.asInstanceOf[Ptr[CDouble]],
-                inputHeight.toUSize,
-                inputWidth.toUSize,
-                inputChannels.toUSize,
-              )
-              result = MLPack.perform_maxpooling(
-                poolParams,
-                colMajorInput,
-                inputHeight.toUSize,
-                inputWidth.toUSize,
-                inputChannels.toUSize,
-              )
-
-              rowMajorOutput =
-                MLPack.convert_column_to_row_major(result._1, result._2, result._3, result._4)
-              val totalElements = (result._2 * result._3 * result._4).toLong
-
-              memcpy(
-                outputPtr,
-                rowMajorOutput.asInstanceOf[Ptr[Byte]],
-                totalElements.toUSize * sizeof[CDouble],
-              )
-              ()
-            } finally {
-              if (colMajorInput != null) MLPack.free_converted_memory(colMajorInput)
-              if (result != null) MLPack.free_op_result(result)
-              if (rowMajorOutput != null) MLPack.free_converted_memory(rowMajorOutput)
-            }
-
-          case other =>
-            throw new NotImplementedError(s"MaxPool input data type $other not supported.")
-        }
-      } finally
-        if (poolParams != null) MLPack.free_maxpooling_parameters(poolParams)
+        case other =>
+          throw new NotImplementedError(s"MaxPool input data type $other not supported.")
+      }
     }
 
   /** Handles Matrix Multiplication using OpenBLAS CBLAS functions. Performs C = A * B where A is
@@ -1027,70 +919,25 @@ object Interpreter {
   private def handleSoftmax(op: Operation.Softmax, memory: MemoryMap, model: ModelIR): IO[Unit] =
     IO {
       val inputAlloc = model.allocations(op.input)
-      val inputShape = inputAlloc.shape
-
-      val (inputChannels, inputHeight, inputWidth) = inputShape.length match {
-        case 1 => (1, 1, inputShape(0)) // 1D: treat as width, softmax across this dimension
-        case 2 => (1, inputShape(0), inputShape(1)) // 2D: height x width, softmax across width
-        case 3 =>
-          (
-            inputShape(0),
-            inputShape(1),
-            inputShape(2),
-          ) // 3D: channels x height x width, softmax across width
-        case 4 =>
-          (
-            inputShape(1),
-            inputShape(2),
-            inputShape(3),
-          ) // 4D: batch x channels x height x width, softmax across width
-        case _ =>
-          throw new IllegalArgumentException(s"Unsupported input shape for Softmax: ${inputShape}")
-      }
+      val inputSize = inputAlloc.shape.product // Total number of elements
 
       val inputPtr = memory(op.input)
       val outputPtr = memory(op.output)
 
       inputAlloc.dataType match {
         case DataType.Float32 =>
-          var result: Ptr[MLPack.FOpResult] = null
-          try {
-            result = MLPack.F_perform_softmax(
-              inputPtr.asInstanceOf[Ptr[CFloat]],
-              inputHeight.toUSize,
-              inputWidth.toUSize,
-              inputChannels.toUSize,
-            )
-
-            val totalElements = (result._2 * result._3 * result._4).toLong
-            memcpy(
-              outputPtr,
-              result._1.asInstanceOf[Ptr[Byte]],
-              totalElements.toUSize * sizeof[CFloat],
-            )
-            ()
-          } finally
-            if (result != null) MLPack.free_Fop_result(result)
+          MLPack.F_perform_softmax_direct(
+            inputPtr.asInstanceOf[Ptr[CFloat]],
+            inputSize.toUSize,
+            outputPtr.asInstanceOf[Ptr[CFloat]],
+          )
 
         case DataType.Float64 =>
-          var result: Ptr[MLPack.OpResult] = null
-          try {
-            result = MLPack.perform_softmax(
-              inputPtr.asInstanceOf[Ptr[CDouble]],
-              inputHeight.toUSize,
-              inputWidth.toUSize,
-              inputChannels.toUSize,
-            )
-
-            val totalElements = (result._2 * result._3 * result._4).toLong
-            memcpy(
-              outputPtr,
-              result._1.asInstanceOf[Ptr[Byte]],
-              totalElements.toUSize * sizeof[CDouble],
-            )
-            ()
-          } finally
-            if (result != null) MLPack.free_op_result(result)
+          MLPack.perform_softmax_direct(
+            inputPtr.asInstanceOf[Ptr[CDouble]],
+            inputSize.toUSize, // Assuming size fits in Int for the Double version
+            outputPtr.asInstanceOf[Ptr[CDouble]],
+          )
 
         case other =>
           throw new NotImplementedError(s"Softmax input data type $other not supported.")
