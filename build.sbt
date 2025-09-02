@@ -19,7 +19,7 @@ ThisBuild / githubWorkflowBuildPreamble ++= nativeBrewInstallWorkflowSteps.value
 
 ThisBuild / Test / testOptions += Tests.Argument("+l") // for munit logging
 
-val CatsEffectVersion = "3.7-8f2b497"
+val CatsEffectVersion = "3.7.0-RC1"
 val CatsVersion = "2.12.0"
 val MunitVersion = "1.0.4"
 lazy val root = tlCrossRootProject.aggregate(ir, onnx, runtime)
@@ -69,9 +69,14 @@ lazy val runtime = project
   .settings(
     name := "vilcacora-runtime",
     libraryDependencies ++= Seq(
-      "org.typelevel" %%% "cats-effect-kernel" % CatsEffectVersion,
+      "org.typelevel" %%% "cats-effect" % CatsEffectVersion,
       "org.typelevel" %%% "cats-core" % CatsVersion,
       "org.scalameta" %%% "munit" % MunitVersion % Test,
     ),
-    nativeBrewFormulas ++= Set("openblas", "mlpack"),
+    nativeBrewFormulas ++= Set("openblas", "mlpack", "libsvm"),
+    nativeConfig ~= { c =>
+      c.withCompileOptions(
+        c.compileOptions ++ Seq("-fexceptions", "-frtti", "-Wno-inconsistent-missing-override"),
+      )
+    },
   )

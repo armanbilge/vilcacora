@@ -93,11 +93,69 @@ object Translator {
     // Create allocations for constant tensors, which include initial data.
     val initializerAllocations: Either[String, List[Allocation]] =
       graph.initializer.toList.traverse(createAllocationFromInitializer)
+    // This new section manually creates allocations for intermediate tensors
+    // that are not explicitly declared in the ONNX graph's value_info.
+
+    val manuallyCreatedAllocs = for {
+      valAllocs <- valueAllocations
+      initAllocs <- initializerAllocations
+      // Create a temporary map of all known allocations so far for lookups.
+      existingAllocs = (valAllocs ++ initAllocs).map(a => a.name -> a).toMap
+
+      // Iterate through all nodes to find any that need special handling.
+      newAllocs <- graph.node.toList.flatTraverse { node =>
+        node.opType match {
+          case "SVMClassifier" =>
+            for {
+              _ <- checkArity(node, 1, 2) // Ensure SVMClassifier has 2 outputs
+              scoresOutputName = node.output(1)
+              // Check if an allocation for the scores tensor already exists.
+              allocations <-
+                if (existingAllocs.contains(scoresOutputName)) {
+                  // If it exists, we don't need to do anything.
+                  Right(List.empty[Allocation])
+                } else {
+                  // If it doesn't exist, create it manually.
+                  for {
+                    // Get the input tensor's allocation to infer the batch size.
+                    inputAlloc <- existingAllocs
+                      .get(node.input.head)
+                      .toRight(
+                        s"SVM input '${node.input.head}' not found in allocations.",
+                      )
+                    batchSize <- inputAlloc.shape.headOption.toRight(
+                      s"Input '${inputAlloc.name}' for SVM has no dimensions.",
+                    )
+
+                    // Get the number of classes from the node's attributes.
+                    attributes = new OnnxAttributeHelper(node)
+                    classLabels <- attributes.getInts("classlabels_ints")
+                    numClasses = classLabels.size
+
+                    // The ONNX spec defines the scores output as a float tensor.
+                    // We default to Float32. Shape is [batch_size, num_classes].
+                    scoresAlloc = Allocation(
+                      name = scoresOutputName,
+                      dataType = DataType.Float32,
+                      shape = List(batchSize.toInt, numClasses),
+                      initialData = None,
+                    )
+                  } yield List(scoresAlloc)
+                }
+            } yield allocations
+
+          case _ =>
+            // For all other operators, we assume their outputs are properly declared.
+            Right(List.empty[Allocation])
+        }
+      }
+    } yield newAllocs
 
     for {
       valAllocs <- valueAllocations
       initAllocs <- initializerAllocations
-    } yield (valAllocs ++ initAllocs).map(a => a.name -> a).toMap
+      manualAllocs <- manuallyCreatedAllocs
+    } yield (valAllocs ++ initAllocs ++ manualAllocs).map(a => a.name -> a).toMap
   }
 
   /** Translates a single ONNX `NodeProto` into its corresponding IR `Operation`.
@@ -106,7 +164,7 @@ object Translator {
     val attributes = new OnnxAttributeHelper(node)
     node.opType match {
       // Group simple binary operators
-      case "MatMul" | "Add" | "Mul" =>
+      case "MatMul" | "Add" | "Mul" | "Div" =>
         for {
           // The arity check ensures the .head and (1) accessors below are safe.
           _ <- checkArity(node, expectedInputs = 2, expectedOutputs = 1)
@@ -115,6 +173,7 @@ object Translator {
               Right(Operation.MatMul(node.input.head, node.input(1), node.output.head))
             case "Add" => Right(Operation.Add(node.input.head, node.input(1), node.output.head))
             case "Mul" => Right(Operation.Mul(node.input.head, node.input(1), node.output.head))
+            case "Div" => Right(Operation.Div(node.input.head, node.input(1), node.output.head))
             case _ => Left("Internal error: Unreachable code in operator matching")
           }
         } yield op
@@ -151,6 +210,157 @@ object Translator {
           rho = rho.map(_.toDouble).toList,
           supportVectors = supportVectors.map(_.toDouble).toArray,
           vectorsPerClass = vectorsPerClass.toList,
+        )
+
+      // Represents a ReLU (Rectified Linear Unit) activation operation.
+      case "Relu" =>
+        for {
+          _ <- checkArity(node, expectedInputs = 1, expectedOutputs = 1)
+        } yield Operation.Relu(node.input.head, node.output.head)
+
+      // Represents a Reshape operation.
+      case "Reshape" =>
+        for {
+          _ <- checkArity(node, expectedInputs = 2, expectedOutputs = 1)
+          // The 'allowzero' attribute is optional and defaults to 0 (false).
+          allowzero = node.attribute.find(_.name == "allowzero").map(_.i).getOrElse(0L) != 0L
+        } yield Operation.Reshape(
+          input = node.input.head,
+          shape = node.input(1),
+          output = node.output.head,
+          allowzero = allowzero,
+        )
+
+      // Represents a Convolution operation.
+      case "Conv" =>
+        for {
+          _ <-
+            if ((node.input.size == 2 || node.input.size == 3) && node.output.size == 1)
+              Right(())
+            else
+              Left(
+                s"Node '${node.name}' (opType: Conv) expects 2 or 3 inputs and 1 output, but got ${node.input.size} and ${node.output.size}",
+              )
+
+          // 'kernel_shape' is a required attribute.
+          kernelShape <- attributes.getInts("kernel_shape")
+
+          // Handle optional attributes with defaults as per ONNX specification.
+          autoPadStr = node.attribute
+            .find(_.name == "auto_pad")
+            .map(_.s.toStringUtf8())
+            .getOrElse("NOTSET")
+          autoPad <- AutoPad.fromString(autoPadStr)
+          group = node.attribute.find(_.name == "group").map(_.i).getOrElse(1L)
+
+          spatialDims = kernelShape.size
+          dilations = node.attribute
+            .find(_.name == "dilations")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims)(1L))
+          pads = node.attribute
+            .find(_.name == "pads")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims * 2)(0L))
+          strides = node.attribute
+            .find(_.name == "strides")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims)(1L))
+
+        } yield Operation.Conv(
+          input = node.input.head,
+          weight = node.input(1),
+          bias = if (node.input.size == 3) Some(node.input(2)) else None,
+          output = node.output.head,
+          autoPad = autoPad,
+          dilations = dilations.map(_.toInt).toList,
+          group = group.toInt,
+          kernelShape = kernelShape.map(_.toInt).toList,
+          pads = pads.map(_.toInt).toList,
+          strides = strides.map(_.toInt).toList,
+        )
+
+      // Represents a MaxPool operation.
+      case "MaxPool" =>
+        for {
+          // The IR only uses the first output, but ONNX can have a second (indices).
+          _ <-
+            if (node.input.size == 1 && node.output.nonEmpty) Right(())
+            else
+              Left(
+                s"Node '${node.name}' (opType: MaxPool) expects 1 input and at least 1 output, but got ${node.input.size} and ${node.output.size}",
+              )
+
+          // 'kernel_shape' is a required attribute.
+          kernelShape <- attributes.getInts("kernel_shape")
+
+          // Handle optional attributes with defaults.
+          autoPadStr = node.attribute
+            .find(_.name == "auto_pad")
+            .map(_.s.toStringUtf8())
+            .getOrElse("NOTSET")
+          autoPad <- AutoPad.fromString(autoPadStr)
+          ceilMode = node.attribute.find(_.name == "ceil_mode").map(_.i).getOrElse(0L) != 0L
+          storageOrder = node.attribute.find(_.name == "storage_order").map(_.i).getOrElse(0L)
+
+          spatialDims = kernelShape.size
+          dilations = node.attribute
+            .find(_.name == "dilations")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims)(1L))
+          pads = node.attribute
+            .find(_.name == "pads")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims * 2)(0L))
+          strides = node.attribute
+            .find(_.name == "strides")
+            .map(_.ints)
+            .getOrElse(Seq.fill(spatialDims)(1L))
+
+        } yield Operation.MaxPool(
+          input = node.input.head,
+          output = node.output.head,
+          autoPad = autoPad,
+          ceilMode = ceilMode,
+          dilations = dilations.map(_.toInt).toList,
+          kernelShape = kernelShape.map(_.toInt).toList,
+          pads = pads.map(_.toInt).toList,
+          storageOrder = storageOrder.toInt,
+          strides = strides.map(_.toInt).toList,
+        )
+      case "Constant" =>
+        for {
+          // A Constant node has 0 inputs and 1 output.
+          _ <- checkArity(node, expectedInputs = 0, expectedOutputs = 1)
+
+          // The constant's data is stored in a 'value' attribute of type TensorProto.
+          valueAttribute <- node.attribute
+            .find(_.name == "value")
+            .toRight(s"Constant node '${node.name}' is missing the 'value' attribute.")
+
+          tensorProto <- valueAttribute.t
+            .toRight(s"Attribute 'value' in Constant node '${node.name}' is not a tensor.")
+
+          // Use existing helpers to extract the data type and raw bytes.
+          dataType <- fromOnnxDataType(tensorProto.dataType)
+          shape = tensorProto.dims.map(_.toInt).toList
+          data <- extractBytes(tensorProto, dataType)
+
+        } yield Operation.Constant(
+          output = node.output.head,
+          value = data,
+          dataType = dataType,
+          shape = shape,
+        )
+      case "Softmax" =>
+        for {
+          _ <- checkArity(node, expectedInputs = 1, expectedOutputs = 1)
+          // The 'axis' attribute is optional and defaults to -1 in ONNX version 13+
+          axis = node.attribute.find(_.name == "axis").map(_.i).getOrElse(-1L)
+        } yield Operation.Softmax(
+          input = node.input.head,
+          output = node.output.head,
+          axis = axis.toInt,
         )
       case unsupported => Left(s"Unsupported operation type: $unsupported")
     }
@@ -223,8 +433,8 @@ object Translator {
       case 11 => Right(DataType.Float64)
       case 10 => Right(DataType.Float16)
       case 16 => Right(DataType.BFloat16)
-      case 7 => Right(DataType.Int32)
-      case 6 => Right(DataType.Int64)
+      case 6 => Right(DataType.Int32)
+      case 7 => Right(DataType.Int64)
       case 5 => Right(DataType.Int16)
       case 3 => Right(DataType.Int8)
       case 12 => Right(DataType.UInt32)
@@ -256,8 +466,8 @@ object Translator {
       tensor.dataType match {
         case 1 => tensor.floatData.foreach(buffer.putFloat)
         case 11 => tensor.doubleData.foreach(buffer.putDouble)
-        case 7 => tensor.int32Data.foreach(buffer.putInt)
-        case 6 => tensor.int64Data.foreach(buffer.putLong)
+        case 6 => tensor.int32Data.foreach(buffer.putInt)
+        case 7 => tensor.int64Data.foreach(buffer.putLong)
         // Note: Other types like int16 are typically stored in `rawData` or `int32Data`.
         case unsupportedType =>
           return Left(
@@ -294,5 +504,6 @@ object Translator {
         .get(name)
         .toRight(s"Missing attribute '$name' in node '${node.name}'")
         .map(_.ints)
+
   }
 }

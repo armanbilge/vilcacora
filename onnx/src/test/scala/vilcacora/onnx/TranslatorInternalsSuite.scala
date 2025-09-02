@@ -28,9 +28,10 @@ class TranslatorInternalsSuite extends FunSuite {
 
   test("fromOnnxDataType should map known type codes") {
     assertEquals(Translator.fromOnnxDataType(1), Right(DataType.Float32))
-    assertEquals(Translator.fromOnnxDataType(7), Right(DataType.Int32))
+    // ONNX code 6 is INT32, 7 is INT64
+    assertEquals(Translator.fromOnnxDataType(6), Right(DataType.Int32))
+    assertEquals(Translator.fromOnnxDataType(7), Right(DataType.Int64))
   }
-
   test("fromOnnxDataType should fail on unknown type codes") {
     assert(Translator.fromOnnxDataType(999).isLeft)
   }
