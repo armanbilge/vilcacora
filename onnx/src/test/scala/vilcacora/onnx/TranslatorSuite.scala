@@ -42,8 +42,8 @@ class TranslatorSuite extends FunSuite {
       input = Seq("in"),
       output = Seq("out"),
       attribute = Seq(
-        AttributeProto(name = "to", i = 6, `type` = AttributeProto.AttributeType.INT),
-      ), // 6 = INT64
+        AttributeProto(name = "to", i = 7, `type` = AttributeProto.AttributeType.INT),
+      ), // 7 = INT64
     )
     assertEquals(Translator.translateNode(node), Right(Operation.Cast("in", "out", DataType.Int64)))
   }

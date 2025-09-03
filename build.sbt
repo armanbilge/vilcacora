@@ -69,9 +69,9 @@ lazy val runtime = project
   .settings(
     name := "vilcacora-runtime",
     libraryDependencies ++= Seq(
-      "org.typelevel" %%% "cats-effect-kernel" % CatsEffectVersion,
+      "org.typelevel" %%% "cats-effect" % CatsEffectVersion,
       "org.typelevel" %%% "cats-core" % CatsVersion,
       "org.scalameta" %%% "munit" % MunitVersion % Test,
     ),
-    nativeBrewFormulas ++= Set("openblas", "mlpack"),
+    nativeBrewFormulas ++= Set("openblas", "mlpack", "libsvm"),
   )
